@@ -54,3 +54,16 @@ def test_prefill_scales_linearly_ish():
     a = prefill(cfg, DGX_SPARK, InferencePlan(), 4096).t_us
     b = prefill(cfg, DGX_SPARK, InferencePlan(), 16384).t_us
     assert 3.5 < b / a < 5.0
+
+
+def test_decode_weight_matrices_cover_the_model():
+    from cirrus.perf.shapes import decode_weight_matrices
+
+    cfg = get_config("cirrus-s-1a")
+    mats = decode_weight_matrices(cfg, include_mtp=False)
+    total = sum(n * k for _, n, k in mats)
+    expected = cfg.backbone_params() + cfg.embedding_params()
+    # only norms, conv taps and decay scalars are left out
+    assert 0.995 < total / expected <= 1.0
+    for _, n, k in mats:
+        assert k % 32 == 0  # NVFP4 kernel streams 32-value chunks
