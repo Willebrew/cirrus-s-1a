@@ -33,21 +33,21 @@ LayerKind = Literal["gdn", "swa", "cross"]
 class ModelConfig:
     name: str = "cirrus-s-1a"
     vocab_size: int = 32_768
-    d_model: int = 1024
+    d_model: int = 768
     # Self-decoder pattern, repeated. "gdn" = Gated DeltaNet, "swa" = sliding
     # window GQA attention.
     self_pattern: tuple[LayerKind, ...] = ("gdn", "gdn", "gdn", "swa")
     n_self_layers: int = 12
-    n_cross_layers: int = 8
+    n_cross_layers: int = 6
 
     # Gated DeltaNet
-    gdn_heads: int = 8
+    gdn_heads: int = 6
     gdn_head_dim_k: int = 128
     gdn_head_dim_v: int = 128
     gdn_conv_size: int = 4
 
     # Attention (shared by swa + cross layers)
-    n_q_heads: int = 8
+    n_q_heads: int = 6
     n_kv_heads: int = 2
     head_dim: int = 128
     swa_window: int = 1024
@@ -62,7 +62,7 @@ class ModelConfig:
     indexer_dim: int = 64
 
     # FFN (SwiGLU)
-    ffn_hidden: int = 2816
+    ffn_hidden: int = 2048
 
     # Multi-token prediction draft module (DeepSeek-V3 style, but FFN-only and
     # reused recursively for ``mtp_passes`` draft positions). It predicts over
@@ -180,19 +180,20 @@ class ModelConfig:
 
 # ----------------------------------------------------------------- presets
 PRESETS: dict[str, ModelConfig] = {
-    # The main target. ~0.3B total, sized so NVFP4 weights + 32K context
-    # shared KV fit the per-step bandwidth budget with spec decoding.
+    # The model we are building: ~155M params, ~99 MB streamed per verify
+    # step (NVFP4), which clears 3,000 tok/s on Spark at >= ~1.7 accepted
+    # tokens per step and ~2,000 tok/s with no speculation at all.
     "cirrus-s-1a": ModelConfig(),
-    # Fallback if the speed budget is missed without speculative decoding.
-    "cirrus-s-1a-mini": ModelConfig(
-        name="cirrus-s-1a-mini",
-        d_model=768,
+    # Bigger sibling, kept for comparison: only viable if measured τ >= ~2.8.
+    "cirrus-s-1a-large": ModelConfig(
+        name="cirrus-s-1a-large",
+        d_model=1024,
         n_self_layers=12,
-        n_cross_layers=6,
-        gdn_heads=6,
-        n_q_heads=6,
+        n_cross_layers=8,
+        gdn_heads=8,
+        n_q_heads=8,
         n_kv_heads=2,
-        ffn_hidden=2048,
+        ffn_hidden=2816,
     ),
     # Tiny config for unit tests / CPU smoke runs.
     "cirrus-s-1a-debug": ModelConfig(

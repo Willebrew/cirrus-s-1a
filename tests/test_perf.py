@@ -6,8 +6,15 @@ from cirrus.perf.roofline import InferencePlan, decode_step, expected_tokens_per
 
 
 def test_param_counts_are_in_target_range():
-    assert 250e6 < get_config("cirrus-s-1a").total_params() < 350e6
-    assert 120e6 < get_config("cirrus-s-1a-mini").total_params() < 200e6
+    assert 120e6 < get_config("cirrus-s-1a").total_params() < 200e6
+    assert 250e6 < get_config("cirrus-s-1a-large").total_params() < 350e6
+
+
+def test_main_preset_meets_speed_target():
+    cfg = get_config("cirrus-s-1a")
+    plan = InferencePlan(tokens_per_step=1.8)
+    assert decode_step(cfg, DGX_SPARK, plan, 32768).tokens_per_second >= 3000
+    assert decode_step(cfg, DGX_SPARK, InferencePlan(use_mtp=False), 32768).tokens_per_second >= 1900
     for cfg in PRESETS.values():
         assert len(cfg.layer_kinds) == cfg.n_layers
 

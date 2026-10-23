@@ -38,9 +38,9 @@ the weights have learned (except τ, which is measured separately in 1d).
     protocol on search-style prompts, and measure prompt-lookup acceptance on its outputs. This
     gives the copy-rate prior before cirrus exists.
 
-**Decision gate:** pick `cirrus-s-1a` (~290M) or `cirrus-s-1a-mini` (~155M) using the measured
-roofline and τ. The rule: take the largest model whose *measured* 32K-context throughput is
-≥ 3,000 tok/s at the *measured* τ.
+**Decision (made):** build `cirrus-s-1a` at ~155M params (the former "mini"). Its predicted
+throughput is ≥ 3,000 tok/s at τ ≥ 1.65. Phase 1 confirms it on hardware; `cirrus-s-1a-large`
+(~290M) is only reconsidered if the *measured* numbers show at least 1.8× headroom.
 
 ## Phase 2: tokenizer + data pipeline
 
