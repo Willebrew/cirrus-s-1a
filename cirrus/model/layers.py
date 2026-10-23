@@ -257,12 +257,19 @@ def indexer_scores(iq, iw, ik):
 
 def topk_mask(scores: torch.Tensor, causal: torch.Tensor, k: int) -> torch.Tensor:
     """Keep the top-k causally visible keys per query (always keeps the
-    diagonal so a query can attend to itself)."""
+    diagonal so a query can attend to itself).
+
+    Ties are common (relu indexer scores are often exactly 0) and must break
+    identically in prefill, where a row also holds masked future keys, and in
+    decode, where it does not. ``topk`` gives no such guarantee, so sort
+    stably with the most recent key first; the kernel must use the same rule.
+    """
     Tk = scores.shape[-1]
     if k >= Tk:
         return causal
     s = scores.masked_fill(~causal, float("-inf"))
-    idx = s.topk(k, dim=-1).indices
+    order = s.flip(-1).sort(dim=-1, descending=True, stable=True).indices[..., :k]
+    idx = Tk - 1 - order
     sel = torch.zeros(s.shape, dtype=torch.bool, device=s.device).scatter(-1, idx, True)
     diag = torch.zeros_like(sel)
     diag[..., :, -scores.shape[-2]:] = torch.eye(scores.shape[-2], dtype=torch.bool, device=scores.device)

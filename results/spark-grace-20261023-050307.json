@@ -1,0 +1,231 @@
+{
+  "sections": {
+    "environment": {
+      "host": "grace",
+      "platform": "Linux-7.0.0-1019-nvidia-aarch64-with-glibc2.39",
+      "python": "3.12.13",
+      "torch": "2.13.0+cu130",
+      "torch_cuda": "13.0",
+      "device": "NVIDIA GB10",
+      "capability": "12.1",
+      "sms": 48,
+      "total_mem_gb": 130.7,
+      "l2_bytes": 25165824,
+      "nvidia_smi": "NVIDIA GB10, 580.178.04, 3003 MHz, [N/A]",
+      "nvcc": "Cuda compilation tools, release 13.0, V13.0.88\nBuild cuda_13.0.r13.0/compiler.36424714_0",
+      "dgx_os": "DGX_NAME=\"DGX Spark\"\nDGX_PRETTY_NAME=\"NVIDIA DGX Spark\"\nDGX_SWBUILD_DATE=\"2025-10-04-06-28-28\"\nDGX_SWBUILD_VERSION=\"7.2.3\"\nDGX_COMMIT_ID=\"03dc741\"",
+      "gpu_processes": "",
+      "triton": "3.7.1",
+      "fla": null
+    },
+    "dram_bandwidth": {
+      "best_read_gbps": 238.4,
+      "efficiency_vs_273": 0.873,
+      "torch_sum_gbps": 238.0,
+      "torch_copy_gbps_rw": 219.1,
+      "configs": [
+        {
+          "blocks_per_sm": 2,
+          "threads": 256,
+          "gbps": 236.4
+        },
+        {
+          "blocks_per_sm": 2,
+          "threads": 512,
+          "gbps": 237.7
+        },
+        {
+          "blocks_per_sm": 2,
+          "threads": 1024,
+          "gbps": 235.3
+        },
+        {
+          "blocks_per_sm": 4,
+          "threads": 256,
+          "gbps": 237.2
+        },
+        {
+          "blocks_per_sm": 4,
+          "threads": 512,
+          "gbps": 236.5
+        },
+        {
+          "blocks_per_sm": 4,
+          "threads": 1024,
+          "gbps": 235.9
+        },
+        {
+          "blocks_per_sm": 8,
+          "threads": 256,
+          "gbps": 235.4
+        },
+        {
+          "blocks_per_sm": 8,
+          "threads": 512,
+          "gbps": 236.0
+        },
+        {
+          "blocks_per_sm": 8,
+          "threads": 1024,
+          "gbps": 238.0
+        },
+        {
+          "blocks_per_sm": 16,
+          "threads": 256,
+          "gbps": 234.6
+        },
+        {
+          "blocks_per_sm": 16,
+          "threads": 512,
+          "gbps": 236.9
+        },
+        {
+          "blocks_per_sm": 16,
+          "threads": 1024,
+          "gbps": 238.4
+        }
+      ]
+    },
+    "l2_sweep": {
+      "points": [
+        {
+          "mb": 1,
+          "gbps": 1904.0
+        },
+        {
+          "mb": 2,
+          "gbps": 2072.4
+        },
+        {
+          "mb": 4,
+          "gbps": 2074.4
+        },
+        {
+          "mb": 8,
+          "gbps": 2118.5
+        },
+        {
+          "mb": 12,
+          "gbps": 2045.0
+        },
+        {
+          "mb": 16,
+          "gbps": 2029.5
+        },
+        {
+          "mb": 20,
+          "gbps": 2087.0
+        },
+        {
+          "mb": 24,
+          "gbps": 2041.2
+        },
+        {
+          "mb": 28,
+          "gbps": 2012.7
+        },
+        {
+          "mb": 32,
+          "gbps": 2049.1
+        },
+        {
+          "mb": 48,
+          "gbps": 2018.5
+        },
+        {
+          "mb": 64,
+          "gbps": 1941.0
+        },
+        {
+          "mb": 128,
+          "gbps": 321.3
+        },
+        {
+          "mb": 256,
+          "gbps": 232.0
+        }
+      ],
+      "l2_plateau_gbps": 2043.1,
+      "largest_l2_resident_mb": 64,
+      "note": "buffers were all-ones (constant data)"
+    },
+    "grid_barrier": {
+      "coop_grid_sync_1bpsm_us": 0.61,
+      "coop_grid_sync_2bpsm_us": 0.623,
+      "atomic_flag_1bpsm_us": 1.029,
+      "atomic_flag_2bpsm_us": 1.067,
+      "best_us": 0.61
+    },
+    "launch_overhead": {
+      "eager_us_per_kernel": 3.3,
+      "graph_us_per_node": 0.937
+    },
+    "host_roundtrip": {
+      "roundtrip_us_python": 12.51
+    },
+    "nvfp4_gemv_correctness": {
+      "max_rel_err": 2.0084692664568138e-07
+    },
+    "decode_weight_stream": {
+      "n_matrices": 111,
+      "nvfp4_mb": 90.8,
+      "nvfp4_M1_us": 963.0,
+      "nvfp4_M1_gbps": 94.3,
+      "nvfp4_M2_us": 1686.9,
+      "nvfp4_M2_gbps": 53.8,
+      "nvfp4_M4_us": 3134.2,
+      "nvfp4_M4_gbps": 29.0,
+      "nvfp4_M8_us": 5947.7,
+      "nvfp4_M8_gbps": 15.3,
+      "nvfp4_M13_us": 9512.3,
+      "nvfp4_M13_gbps": 9.5,
+      "bf16_M1_us": 1814.8,
+      "bf16_M1_gbps": 177.9,
+      "bf16_M8_us": 1877.5,
+      "bf16_M8_gbps": 171.9
+    },
+    "prefill_gemm": {
+      "bf16_4096x768_tflops": 75.0,
+      "fp8_4096x768_tflops": 112.8,
+      "bf16_768x2048_tflops": 93.0,
+      "fp8_768x2048_tflops": 151.7,
+      "bf16_2304x768_tflops": 65.2,
+      "fp8_2304x768_tflops": 97.8
+    },
+    "model_smoke_test": {
+      "params": 155221100,
+      "incremental_rel_err": 6.749391559424112e-06
+    }
+  },
+  "errors": {},
+  "tests": "1 failed, 32 passed: test_incremental_decode_matches_full_forward[True] (sparse top-k tie-break bug, fixed after this run)",
+  "predicted_tok_s_estimated_hw": {
+    "tau1.0_ctx4096": 2047,
+    "tau1.0_ctx32768": 2013,
+    "tau1.0_ctx65536": 1974,
+    "tau1.65_ctx4096": 3087,
+    "tau1.65_ctx32768": 3039,
+    "tau1.65_ctx65536": 2987,
+    "tau2.0_ctx4096": 3742,
+    "tau2.0_ctx32768": 3684,
+    "tau2.0_ctx65536": 3620,
+    "tau2.5_ctx4096": 4678,
+    "tau2.5_ctx32768": 4605,
+    "tau2.5_ctx65536": 4525
+  },
+  "predicted_tok_s_measured_hw": {
+    "tau1.0_ctx4096": 2334,
+    "tau1.0_ctx32768": 2293,
+    "tau1.0_ctx65536": 2247,
+    "tau1.65_ctx4096": 3535,
+    "tau1.65_ctx32768": 3478,
+    "tau1.65_ctx65536": 3415,
+    "tau2.0_ctx4096": 4285,
+    "tau2.0_ctx32768": 4216,
+    "tau2.0_ctx65536": 4139,
+    "tau2.5_ctx4096": 5357,
+    "tau2.5_ctx32768": 5270,
+    "tau2.5_ctx65536": 5174
+  },
+  "elapsed_s": 18.9
+}

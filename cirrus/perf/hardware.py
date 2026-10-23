@@ -1,8 +1,8 @@
 """Hardware descriptions used by the roofline model.
 
-Every number here should carry a source in docs/research/dgx-spark.md. Values
-marked ``ESTIMATE`` are engineering guesses that must be replaced by
-measurements from ``scripts/bench_spark.py`` once we have a Spark in hand.
+Every number here carries a source. Values marked ``ESTIMATE`` are still
+engineering guesses; the rest were measured with ``scripts/bench_spark.py``
+(see docs/research/spark-measurements.md).
 """
 
 from __future__ import annotations
@@ -43,25 +43,25 @@ class HardwareSpec:
 
 
 # NVIDIA DGX Spark, GB10 Grace Blackwell superchip.
-# Confirmed: 128 GB LPDDR5x unified, 273 GB/s, 6144 CUDA cores (48 SMs),
-# 1 PFLOP sparse FP4. See docs/research/dgx-spark.md for sources and the
-# remaining ESTIMATE fields.
+# MEASURED on "grace" (DGX OS 7.2.3, driver 580.178.04, CUDA 13.0, torch
+# 2.13.0+cu130) by scripts/bench_spark.py on 2026-10-23; raw data in
+# results/spark-grace-20261023-050307.json. Peak figures are NVIDIA's spec.
 DGX_SPARK = HardwareSpec(
     name="DGX Spark (GB10)",
-    dram_bw_gbps=273.0,
-    dram_efficiency=0.80,       # ESTIMATE: LPDDR5x streaming, refine w/ nvbandwidth
+    dram_bw_gbps=273.0,         # spec
+    dram_efficiency=0.873,      # measured: 238.4 GB/s streaming read
     memory_gb=128.0,
-    n_sms=48,
-    l2_bytes=24 * 2**20,        # ESTIMATE pending confirmation
-    l2_bw_gbps=1500.0,          # ESTIMATE
+    n_sms=48,                   # measured
+    l2_bytes=24 * 2**20,        # measured (cudaDeviceProp.l2CacheSize)
+    l2_bw_gbps=2043.0,          # measured plateau, working sets <= 24 MB
     smem_per_sm_bytes=100 * 1024,
-    tflops_fp4=500.0,           # 1 PFLOP sparse -> ~500 dense
-    tflops_fp8=250.0,           # ESTIMATE (half of FP4 dense)
-    tflops_bf16=125.0,          # ESTIMATE (half of FP8 dense)
-    tensor_efficiency=0.45,     # ESTIMATE: small-model GEMMs rarely saturate
-    grid_barrier_us=1.0,        # ESTIMATE: cooperative-groups grid.sync on 48 SMs
-    kernel_launch_us=2.5,       # ESTIMATE: graph node + tail effect
-    host_sync_us=15.0,          # ESTIMATE: unified memory, no PCIe
+    tflops_fp4=300.0,           # ESTIMATE: ~2x measured FP8; not yet measured
+    tflops_fp8=152.0,           # measured best on decoder-shaped prefill GEMMs
+    tflops_bf16=93.0,           # measured best on decoder-shaped prefill GEMMs
+    tensor_efficiency=1.0,      # the tflops above are achieved, not peak
+    grid_barrier_us=0.61,       # measured: cooperative grid.sync(), 48 blocks
+    kernel_launch_us=0.94,      # measured: CUDA graph node
+    host_sync_us=12.5,          # measured: GPU->CPU->GPU from Python
 )
 
 HARDWARE: dict[str, HardwareSpec] = {"dgx-spark": DGX_SPARK}

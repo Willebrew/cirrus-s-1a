@@ -136,13 +136,17 @@ double time_read(torch::Tensor buf, int64_t iters, int64_t blocks, int64_t threa
 double time_coop_barrier(int64_t n, int64_t blocks, int64_t threads);
 double time_flag_barrier(int64_t n, int64_t blocks, int64_t threads);
 torch::Tensor nvfp4_gemv(torch::Tensor W, torch::Tensor S, torch::Tensor X, double gscale);
+torch::Tensor nvfp4_mma_gemv(torch::Tensor W, torch::Tensor S, torch::Tensor X, int64_t N, double gscale, torch::Tensor Y);
+void run_stream(torch::Tensor descs, torch::Tensor stage_first, int64_t n_stages, int64_t M, int64_t kmax);
+double time_stream(torch::Tensor descs, torch::Tensor stage_first, int64_t n_stages, int64_t M, int64_t iters, int64_t kmax);
 """
     log(f"   building CUDA kernels for sm_{major}{minor} (first run takes ~1 min)...")
     return load_inline(
         name="cirrus_bench",
         cpp_sources=decls,
         cuda_sources=src,
-        functions=["time_read", "time_coop_barrier", "time_flag_barrier", "nvfp4_gemv"],
+        functions=["time_read", "time_coop_barrier", "time_flag_barrier", "nvfp4_gemv", "nvfp4_mma_gemv",
+                   "run_stream", "time_stream"],
         extra_cuda_cflags=["-O3", "-lineinfo"],
         verbose=False,
     )
@@ -179,15 +183,21 @@ def dram_bandwidth(ext, sms: int) -> dict:
 
 @section("l2_sweep")
 def l2_sweep(ext, sms: int) -> dict:
+    # Random data: the first run used all-ones buffers and saw L2-like speed up
+    # to 64 MB (> the 24 MB L2), so compare against constant data to rule out
+    # hardware compression or another cache level.
     rows = []
-    for size_mb in (1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 128, 256):
-        buf = torch.ones(size_mb * MB, dtype=torch.uint8, device="cuda")
+    for size_mb in (1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 64, 96, 128, 256):
+        buf = torch.empty(size_mb * MB, dtype=torch.uint8, device="cuda").random_(0, 256)
+        ones = torch.ones(size_mb * MB, dtype=torch.uint8, device="cuda")
         iters = max(1, (4096 // size_mb))  # ~4 GB of traffic per point
         ms = min(ext.time_read(buf, iters, sms * 8, 512) for _ in range(3))
+        ms1 = min(ext.time_read(ones, iters, sms * 8, 512) for _ in range(3))
         gbps = size_mb * MB * iters / (ms * 1e-3) / 1e9
-        rows.append({"mb": size_mb, "gbps": round(gbps, 1)})
-        log(f"   {size_mb:4d} MB working set: {gbps:8.1f} GB/s")
-        del buf
+        gbps1 = size_mb * MB * iters / (ms1 * 1e-3) / 1e9
+        rows.append({"mb": size_mb, "gbps": round(gbps, 1), "gbps_constant_data": round(gbps1, 1)})
+        log(f"   {size_mb:4d} MB working set: random {gbps:8.1f} GB/s | constant {gbps1:8.1f} GB/s")
+        del buf, ones
     dram = rows[-1]["gbps"]
     in_l2 = [r for r in rows if r["gbps"] > 1.5 * dram]
     return {
@@ -343,6 +353,143 @@ def decode_weight_stream(ext) -> dict:
     return out
 
 
+# ------------------------------------------------- v1: tensor-core NVFP4
+def pack_nvfp4_mma(codes: torch.Tensor, scales: torch.Tensor):
+    """Standard NVFP4 ([N, K] E2M1 codes 0..15, [N, K/16] E4M3 scale bytes)
+    -> the fragment-major layout read by mma_task in bench_kernels.cu."""
+    N, K = codes.shape
+    Np = (N + 15) // 16 * 16
+    if Np != N:
+        codes = torch.cat((codes, codes.new_zeros(Np - N, K)))
+        scales = torch.cat((scales, scales.new_zeros(Np - N, K // 16)))
+    NT, KT = Np // 16, K // 64
+    C = codes.view(NT, 16, KT, 4, 16).long()  # [nt, row, kt, k16 block, col]
+    lanes = []
+    for lane in range(32):
+        g, c = lane >> 2, lane & 3
+        k0, k8 = 2 * c, 2 * c + 8
+        nib = torch.stack(
+            [C[:, g, :, :, k0], C[:, g, :, :, k0 + 1], C[:, g + 8, :, :, k0], C[:, g + 8, :, :, k0 + 1],
+             C[:, g, :, :, k8], C[:, g, :, :, k8 + 1], C[:, g + 8, :, :, k8], C[:, g + 8, :, :, k8 + 1]],
+            dim=-1,
+        )  # [nt, kt, block j, 8 nibbles]
+        lanes.append((nib[..., 0::2] | (nib[..., 1::2] << 4)).to(torch.uint8))  # [nt, kt, 4, 4]
+    W = torch.stack(lanes, dim=2).reshape(-1)  # [nt, kt, lane, 16 bytes]
+    S = scales.view(NT, 16, KT, 4).permute(0, 2, 1, 3).contiguous().reshape(-1)  # [nt, kt, row, block]
+    return W.contiguous(), S
+
+
+def random_nvfp4(n: int, k: int, gen: torch.Generator):
+    codes = torch.randint(0, 16, (n, k), dtype=torch.uint8, device="cuda", generator=gen)
+    scales = (torch.rand(n, k // 16, device="cuda", generator=gen) * 0.9 + 0.1).to(torch.float8_e4m3fn)
+    return codes, scales.view(torch.uint8)
+
+
+def dequant_codes(codes: torch.Tensor, scales: torch.Tensor, gscale: float = 1.0) -> torch.Tensor:
+    mag = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=codes.device)
+    lut = torch.cat((mag, -mag))
+    sc = scales.view(torch.float8_e4m3fn).float().repeat_interleave(16, dim=-1)
+    return lut[codes.long()] * sc * gscale
+
+
+def build_stream(ext, stages, M: int, gen, keep_ref: bool = False):
+    """Allocate packed weights + I/O for a list of stages; return descriptors."""
+    rows, firsts, mats, refs = [], [0], [], []
+    kmax = max(k for st in stages for _, _, k in st)
+    xs = {k: torch.randn(M, k, device="cuda", generator=gen).half() for k in {k for st in stages for _, _, k in st}}
+    y_total = sum(M * n for st in stages for _, n, _ in st)
+    Y = torch.zeros(y_total, device="cuda")
+    off = 0
+    for s, st in enumerate(stages):
+        task_off = 0
+        for name, n, k in st:
+            codes, scales = random_nvfp4(n, k, gen)
+            W, S = pack_nvfp4_mma(codes, scales)
+            y = Y[off : off + M * n]
+            off += M * n
+            rows.append([W.data_ptr(), S.data_ptr(), xs[k].data_ptr(), y.data_ptr(), n | (k << 32), s | (task_off << 32)])
+            task_off += ((n + 15) // 16) * (k // 128)
+            mats.append((W, S))
+            if keep_ref:
+                refs.append((y, xs[k].float() @ dequant_codes(codes, scales).T))
+        firsts.append(len(rows))
+    descs = torch.tensor(rows, dtype=torch.int64, device="cuda")
+    sf = torch.tensor(firsts, dtype=torch.int32, device="cuda")
+    return {"descs": descs, "stage_first": sf, "n_stages": len(stages), "kmax": kmax, "Y": Y, "keep": (mats, xs),
+            "refs": refs, "bytes": sum(W.numel() + S.numel() for W, S in mats)}
+
+
+@section("nvfp4_mma_correctness")
+def nvfp4_mma_correctness(ext) -> dict:
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    worst = 0.0
+    for m in (1, 4, 8, 13):
+        for n, k in ((768, 768), (12, 768), (4096, 768), (768, 2048), (768, 1536)):
+            codes, scales = random_nvfp4(n, k, gen)
+            W, S = pack_nvfp4_mma(codes, scales)
+            x = torch.randn(m, k, device="cuda", generator=gen).half()
+            y = torch.zeros(m, n, device="cuda")
+            ext.nvfp4_mma_gemv(W, S, x, n, 0.5, y)
+            ref = x.float() @ dequant_codes(codes, scales, 0.5).T
+            worst = max(worst, ((y - ref).abs().max() / ref.abs().max()).item())
+    # persistent kernel on a small multi-stage program
+    stages = [[("a", 768, 768), ("b", 12, 768)], [("c", 768, 2048)], [("d", 4096, 768)]]
+    worst_stream = 0.0
+    for m in (1, 13):
+        st = build_stream(ext, stages, m, gen, keep_ref=True)
+        ext.run_stream(st["descs"], st["stage_first"], st["n_stages"], m, st["kmax"])
+        torch.cuda.synchronize()
+        for y, ref in st["refs"]:
+            worst_stream = max(worst_stream, ((y.view_as(ref) - ref).abs().max() / ref.abs().max()).item())
+    ok = worst < 1e-3 and worst_stream < 1e-3
+    log(f"   mma GEMV max rel err: {worst:.2e}; persistent stream: {worst_stream:.2e} -> {'OK' if ok else 'MISMATCH'}")
+    if not ok:
+        raise AssertionError(f"mma kernels mismatch: gemv {worst}, stream {worst_stream}")
+    return {"gemv_max_rel_err": worst, "stream_max_rel_err": worst_stream}
+
+
+@section("decode_stream_v1")
+def decode_stream_v1(ext) -> dict:
+    """cirrus-s-1a's full decode-step weight stream with the tensor-core kernel:
+    (a) one kernel per matrix in a CUDA graph, (b) ONE persistent cooperative
+    kernel with a grid barrier per fused stage (the megakernel's skeleton)."""
+    from cirrus.perf.shapes import decode_stages
+
+    cfg = get_config("cirrus-s-1a")
+    stages = decode_stages(cfg)
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    out = {"n_stages": len(stages)}
+    for m in (1, 2, 4, 8, 13):
+        st = build_stream(ext, stages, m, gen)
+        mb = st["bytes"] / 1e6
+        iters = 50
+        ms = min(ext.time_stream(st["descs"], st["stage_first"], st["n_stages"], m, iters, st["kmax"]) for _ in range(3))
+        us = ms * 1e3 / iters
+        out[f"persistent_M{m}_us"] = round(us, 1)
+        out[f"persistent_M{m}_gbps"] = round(st["bytes"] / (us * 1e-6) / 1e9, 1)
+        # same work, one kernel per matrix, CUDA graph
+        mats, xs = st["keep"]
+        flat = [(W, S, n, k) for (W, S), (_, n, k) in zip(mats, [x for s in stages for x in s])]
+        Y = st["Y"]
+
+        def per_matrix():
+            Y.zero_()
+            off = 0
+            for W, S, n, k in flat:
+                ext.nvfp4_mma_gemv(W, S, xs[k], n, 1.0, Y[off : off + m * n].view(m, n))
+                off += m * n
+
+        g = capture(per_matrix)
+        gms = cuda_time_ms(g.replay, iters=30)
+        out[f"graph_M{m}_us"] = round(gms * 1e3, 1)
+        out[f"graph_M{m}_gbps"] = round(st["bytes"] / (gms * 1e-3) / 1e9, 1)
+        log(f"   M={m:2d}: persistent {us:7.1f} us ({out[f'persistent_M{m}_gbps']:6.1f} GB/s) | "
+            f"graph {gms * 1e3:7.1f} us ({out[f'graph_M{m}_gbps']:6.1f} GB/s) | {mb:.1f} MB")
+        del st, g
+    out["weight_mb"] = round(mb, 1)
+    return out
+
+
 @section("prefill_gemm")
 def prefill_gemm() -> dict:
     T = 16384
@@ -434,9 +581,35 @@ def predictions(hw) -> dict:
     return rows
 
 
+def stream_based_estimate(hw, stream: dict) -> dict:
+    """Decode tok/s where the weight stream (the dominant ~85% of bytes, plus
+    its barriers) is the measured persistent-kernel time and only the small
+    KV/state traffic still comes from the roofline model."""
+    cfg = get_config("cirrus-s-1a")
+    weight_keys = ("weights.body", "lm_head", "mtp.weights", "mtp.draft_head")
+    out = {}
+    for tau, m in ((1.0, 1), (1.65, 4), (2.0, 4), (2.5, 8), (3.0, 13)):
+        key = f"persistent_M{m}_us"
+        if key not in stream:
+            continue
+        for ctx in (4096, 32768, 65536):
+            s = decode_step(cfg, hw, InferencePlan(tokens_per_step=tau, use_mtp=tau > 1, n_verify=m), ctx)
+            other = s.total_dram_bytes - sum(s.dram_bytes.get(k, 0) for k in weight_keys)
+            t_other = other / hw.eff_dram_bw + sum(s.l2_bytes.values()) / hw.eff_l2_bw
+            # mixer stages (GDN recurrence, attention) add ~1 barrier per layer;
+            # the 2nd MTP pass adds 4 stages; plus the host round trip
+            barriers = cfg.n_layers + (cfg.mtp_passes - 1) * 4 if tau > 1 else cfg.n_layers
+            t_fixed = (barriers * hw.grid_barrier_us + hw.host_sync_us) * 1e-6
+            step = stream[key] * 1e-6 + t_other + t_fixed
+            out[f"tau{tau}_verify{m}_ctx{ctx}"] = round(tau / step)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-model", action="store_true", help="skip the reference-model smoke test")
+    ap.add_argument("--only", nargs="*", default=None,
+                    help="run only these sections (plus environment), e.g. --only l2_sweep decode_stream_v1")
     ap.add_argument("--out", default=str(ROOT / "results"))
     args = ap.parse_args()
     if not torch.cuda.is_available():
@@ -452,21 +625,28 @@ def main() -> None:
         RESULTS["errors"]["build_ext"] = f"{type(e).__name__}: {e}"
         log(f"   kernel build FAILED ({e}); custom-kernel sections will be skipped")
 
-    dram = dram_bandwidth(ext, sms) if ext else None
-    l2 = l2_sweep(ext, sms) if ext else None
-    bar = grid_barrier(ext, sms) if ext else None
-    launch = launch_overhead()
-    host = host_roundtrip()
-    if ext and nvfp4_correctness(ext) is not None:
+    want = lambda name: args.only is None or name in args.only  # noqa: E731
+    dram = dram_bandwidth(ext, sms) if ext and want("dram_bandwidth") else None
+    l2 = l2_sweep(ext, sms) if ext and want("l2_sweep") else None
+    bar = grid_barrier(ext, sms) if ext and want("grid_barrier") else None
+    launch = launch_overhead() if want("launch_overhead") else None
+    host = host_roundtrip() if want("host_roundtrip") else None
+    if ext and want("decode_weight_stream") and nvfp4_correctness(ext) is not None:
         decode_weight_stream(ext)
-    prefill_gemm()
-    if not args.skip_model:
+    stream = None
+    if ext and want("decode_stream_v1") and nvfp4_mma_correctness(ext) is not None:
+        stream = decode_stream_v1(ext)
+    if want("prefill_gemm"):
+        prefill_gemm()
+    if not args.skip_model and want("model_smoke_test"):
         model_smoke_test()
 
     hw, upd = measured_spec(env, dram, l2, bar, launch, host)
     RESULTS["measured_hardware"] = asdict(hw)
     RESULTS["predicted_tok_s_estimated_hw"] = predictions(DGX_SPARK)
     RESULTS["predicted_tok_s_measured_hw"] = predictions(hw)
+    if stream:
+        RESULTS["tok_s_from_measured_stream"] = stream_based_estimate(hw, stream)
     RESULTS["elapsed_s"] = round(time.time() - t0, 1)
 
     log("\n== prediction with MEASURED hardware (cirrus-s-1a, tok/s) ==")
@@ -475,6 +655,10 @@ def main() -> None:
     for k in mea:
         log(f"   {k:24s} {est[k]:>10,d} {mea[k]:>10,d}")
     log(f"   measured overrides: {upd}")
+    if stream:
+        log("\n== tok/s using the MEASURED persistent weight stream (+ roofline for KV/state) ==")
+        for k, v in RESULTS["tok_s_from_measured_stream"].items():
+            log(f"   {k:28s} {v:>8,d}")
     if RESULTS["errors"]:
         log(f"\n   sections with errors: {list(RESULTS['errors'])}")
 

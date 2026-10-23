@@ -18,15 +18,18 @@ a single GPU-hour on training.** Architecture changes are cheap now and very exp
 Everything here runs with **random weights at the real shapes**. Speed does not depend on what
 the weights have learned (except τ, which is measured separately in 1d).
 
-1a. **Microbenchmarks** (`scripts/bench_spark.py`), which replace every `ESTIMATE` in
-    `cirrus/perf/hardware.py`:
+1a. ✅ **Microbenchmarks** (`scripts/bench_spark.py`, run 1 on 2026-10-23; see
+    `docs/research/spark-measurements.md`). They replaced every `ESTIMATE` in
+    `cirrus/perf/hardware.py` except FP4 tensor throughput:
     - achievable DRAM bandwidth for streaming reads (nvbandwidth + a custom GEMV)
     - NVFP4 / FP8 GEMV at M = 1..16 against the bandwidth roofline
     - grid-barrier latency inside a persistent kernel across 48 SMs
     - L2 persisting-access window: how much of the L2 we can pin, and its hit bandwidth
     - GPU↔CPU round trip on unified memory (for CPU-side drafting)
 
-1b. **Decode megakernel v0**: one persistent kernel per verify step covering all layers. GEMVs
+1b. **Decode megakernel.** Run 1 showed a per-matrix CUDA-core GEMV reaches only 94 GB/s.
+    Kernel v1 adds a tensor-core NVFP4 GEMV and a persistent whole-step weight stream (run 2
+    pending). Full target: one persistent kernel per verify step covering all layers. GEMVs
     dequantize NVFP4 in registers, GDN state lives in fp32 registers/SMEM during the step, and
     there is a grid barrier per sync point. Check it against `cirrus.model` outputs.
     **Exit: ≥ 90% of the roofline prediction at τ=1** for the chosen preset.

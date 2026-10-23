@@ -67,3 +67,17 @@ def test_decode_weight_matrices_cover_the_model():
     assert 0.995 < total / expected <= 1.0
     for _, n, k in mats:
         assert k % 32 == 0  # NVFP4 kernel streams 32-value chunks
+
+
+def test_decode_stages_group_shared_inputs():
+    from cirrus.perf.shapes import decode_stages, decode_weight_matrices
+
+    cfg = get_config("cirrus-s-1a")
+    stages = decode_stages(cfg)
+    assert sum(len(s) for s in stages) == len(decode_weight_matrices(cfg))
+    for s in stages:
+        assert len({k for _, _, k in s}) == 1  # one shared input per stage
+    names = [[n for n, _, _ in s] for s in stages]
+    assert ["self0.gdn.qkv", "self0.gdn.gate", "self0.gdn.ab"] in names
+    # per layer: input proj, output proj, ffn up, ffn down
+    assert len(stages) == 4 * cfg.n_layers + 1 + 1 + 4  # + shared, lm_head, mtp(3) + draft head

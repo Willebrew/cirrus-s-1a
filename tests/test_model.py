@@ -95,3 +95,17 @@ def test_speculative_greedy_is_token_identical_to_greedy():
     spec, s_spec = speculative_greedy(m, prompt, 30)
     assert spec == ref
     assert s_spec.steps <= s_ref.steps
+
+
+def test_topk_mask_ties_break_the_same_in_prefill_and_decode():
+    from cirrus.model.layers import topk_mask
+
+    T, k = 12, 4
+    scores = torch.randn(1, T, T).clamp_min(0.0)  # ~half exact zeros, like relu indexer scores
+    scores[..., ::3] = 0.0
+    pos = torch.arange(T)
+    causal = (pos[None, :] <= pos[:, None])[None]
+    full = topk_mask(scores, causal, k)
+    for p in range(T):  # decode row for query p sees only keys 0..p
+        row = topk_mask(scores[:, p : p + 1, : p + 1], causal[:, p : p + 1, : p + 1], k)
+        assert torch.equal(row[0, 0], full[0, p, : p + 1]), p

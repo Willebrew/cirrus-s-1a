@@ -60,3 +60,34 @@ def decode_weight_matrices(cfg: ModelConfig, include_mtp: bool = True) -> list[t
         mats += [("mtp.proj", d, 2 * d), ("mtp.ffn.gate_up", 2 * ffn, d), ("mtp.ffn.down", d, ffn)]
         mats.append(("mtp.draft_head", min(cfg.mtp_draft_vocab, cfg.vocab_size), d))
     return mats
+
+
+def _stage_key(name: str) -> str:
+    """Matrices that read the same input vector run in one fused stage."""
+    if "." not in name:
+        return name
+    prefix, last = name.rsplit(".", 1)
+    if prefix.endswith(".gdn") and last in ("qkv", "gate", "ab"):
+        return prefix + ".in"
+    if prefix.endswith(".swa") and last in ("q", "kv", "gate"):
+        return prefix + ".in"
+    if prefix == "shared":
+        return "shared"
+    if prefix.startswith("cross") and last in ("q", "gate"):
+        return prefix + ".in"
+    return name
+
+
+def decode_stages(cfg: ModelConfig, include_mtp: bool = True) -> list[list[tuple[str, int, int]]]:
+    """Group the decode-step matrices into dependent stages (one grid barrier
+    each in the megakernel). Every matrix in a stage has the same K."""
+    stages: list[list[tuple[str, int, int]]] = []
+    last_key = None
+    for m in decode_weight_matrices(cfg, include_mtp):
+        key = _stage_key(m[0])
+        if stages and key == last_key:
+            stages[-1].append(m)
+        else:
+            stages.append([m])
+        last_key = key
+    return stages
