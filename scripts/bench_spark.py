@@ -1025,23 +1025,15 @@ def stream_based_estimate(hw, stream: dict) -> dict:
     """Decode tok/s where the weight stream (the dominant ~85% of bytes, plus
     its barriers) is the measured persistent-kernel time and only the small
     KV/state traffic still comes from the roofline model."""
-    cfg = get_config("cirrus-s-1a")
-    weight_keys = ("weights.body", "lm_head", "mtp.weights", "mtp.draft_head")
+    from cirrus.perf.estimate import tok_s_from_stream
+
+    measured = {m: stream[f"persistent_M{m}_us"] for m in (1, 2, 4, 8, 13) if f"persistent_M{m}_us" in stream}
     out = {}
     for tau, m in ((1.0, 1), (1.65, 4), (2.0, 4), (2.5, 8), (3.0, 13)):
-        key = f"persistent_M{m}_us"
-        if key not in stream:
+        if m not in measured:
             continue
         for ctx in (4096, 32768, 65536):
-            s = decode_step(cfg, hw, InferencePlan(tokens_per_step=tau, use_mtp=tau > 1, n_verify=m), ctx)
-            other = s.total_dram_bytes - sum(s.dram_bytes.get(k, 0) for k in weight_keys)
-            t_other = other / hw.eff_dram_bw + sum(s.l2_bytes.values()) / hw.eff_l2_bw
-            # mixer stages (GDN recurrence, attention) add ~1 barrier per layer;
-            # the 2nd MTP pass adds 4 stages; plus the host round trip
-            barriers = cfg.n_layers + (cfg.mtp_passes - 1) * 4 if tau > 1 else cfg.n_layers
-            t_fixed = (barriers * hw.grid_barrier_us + hw.host_sync_us) * 1e-6
-            step = stream[key] * 1e-6 + t_other + t_fixed
-            out[f"tau{tau}_verify{m}_ctx{ctx}"] = round(tau / step)
+            out[f"tau{tau}_verify{m}_ctx{ctx}"] = round(tok_s_from_stream(measured, tau, m, ctx, hw=hw))
     return out
 
 

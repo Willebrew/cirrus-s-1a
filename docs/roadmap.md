@@ -37,9 +37,10 @@ the weights have learned (except τ, which is measured separately in 1d).
 1c. **Prefill path**: CUTLASS / cuBLASLt block-scaled NVFP4 GEMMs plus the fla chunked GDN
     kernel. **Exit: 16K tokens in ≤ 40 ms.**
 
-1d. **Measure τ** (accepted tokens per step): run an existing small open model through our
-    protocol on search-style prompts, and measure prompt-lookup acceptance on its outputs. This
-    gives the copy-rate prior before cirrus exists.
+1d. **Measure τ** (accepted tokens per step), `scripts/measure_tau.py`: open models answer
+    real questions from real retrieved sources in our format. Replaying the prompt-lookup
+    drafter over their greedy answers gives the exact copy-drafting τ; the MTP head is modeled on
+    a grid. Each τ is converted to tok/s with the measured run-6 stream.
 
 **Decision (made):** build `cirrus-s-1a` at ~155M params (the former "mini"). Its predicted
 throughput is ≥ 3,000 tok/s at τ ≥ 1.65. Phase 1 confirms it on hardware; `cirrus-s-1a-large`
@@ -56,10 +57,12 @@ throughput is ≥ 3,000 tok/s at τ ≥ 1.65. Phase 1 confirms it on hardware; `
 
 ## Phase 3: pretraining (≈1-1.5T tokens), which needs rented GPUs
 
-Compute: 6·N·D ≈ 1.7-2.6e21 FLOPs. That is **~1.6-2.4k H100-hours** at 300 TFLOPS effective
-(about 1-2 days on 64 H100s). The same run on one Spark would take more than a year, so the
-Spark is for inference and evaluation, not pretraining. Plan: BF16 with FP8 matmuls, and
-WSD (warmup-stable-decay) so mid-training can branch off the stable phase.
+Budget (docs/plans/training-budget.md, `scripts/training_budget.py`): **≈2,760 H100-hours and
+≈$12.6k all-in in the base case** (range ≈$5.6k-$33k). Pretraining is ~60% of the GPU hours,
+about 26 hours on 64 H100s. A single Spark would take more than a year, so the Sparks handle
+inference, evaluation and small ablations. Before booking: measure training tokens/s on one
+rented H100 (the most uncertain input). Plan: BF16 with FP8 matmuls, and WSD
+(warmup-stable-decay) so mid-training can branch off the stable phase.
 
 ## Phase 4: mid-training (50-100B tokens)
 
