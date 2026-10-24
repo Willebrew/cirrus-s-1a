@@ -722,3 +722,324 @@ double time_chase(torch::Tensor next, int64_t start, int64_t hops) {
   CUDA_OK(cudaGetLastError());
   return ms;
 }
+
+// ======================================================================
+// v3: latency-lean persistent stream + per-stage profiling
+// ======================================================================
+// Run 3 showed v2 was latency-bound, not bandwidth-bound: even a 15.6 MB
+// working set that fits in L2 streamed at only 194 GB/s (~5.4 us/stage).
+// Causes and fixes:
+//   * per-chunk dependent global loads (task table -> matrix descriptor ->
+//     weights): descriptors now live in shared memory, tasks are decoded
+//     arithmetically, so the next chunk's loads issue with no global round trip
+//   * load_x serialized 6-16 round trips: now one vectorized round trip
+//   * dequant cost: new nibble order lets each fp16 pair be built with 4 ALU
+//     ops, block scales are converted two at a time and pre-scaled by 2^7 so
+//     products stay exact in fp16; B fragments are one 64-bit LDS
+//
+// Layout v3 (pack_nvfp4_v3 in scripts/bench_spark.py), per 16x64 tile:
+//   weights 512 B: lane L, word j (k16 block j): nibble r and r+4 form A
+//   register r: nib0/4 = (g, 2c/2c+1), nib1/5 = (g+8, 2c/2c+1),
+//   nib2/6 = (g, 2c+8/2c+9), nib3/7 = (g+8, 2c+8/2c+9); g = L/4, c = L%4
+//   scales 64 B: [g 8][j 4][2] = (scale(row g, block j), scale(row g+8, block j))
+// Activations in shared memory are permuted per 16-k block so lane (g, c)
+// finds k = {2c, 2c+1, 2c+8, 2c+9} contiguous: one uint2 load per mma.
+
+#define V3_MAXMATS 192
+#define V3_MAXSTAGES 160
+#define V3_THREADS 512
+
+struct MatDesc3 {
+  long long W, S, X, Y;
+  int N, K;
+  int task_off, splits;  // first task of this matrix in its stage; K-splits per row tile
+  int kchunks, pad;      // K / 128
+};
+struct StageDesc3 {
+  int m0, m1, nkc, total;  // matrices [m0, m1), chunks per task, tasks in stage
+};
+
+template <int R>
+__device__ __forceinline__ uint32_t fp4_pair(uint32_t u) {
+  // fp16x2 bits of (nibble R, nibble R+4) * 2^-14, exact (see fp4x2_to_half2_bits)
+  uint32_t a;
+  if constexpr (R < 3) a = u << (9 - 4 * R);
+  else a = u >> 3;
+  const uint32_t b = u << (12 - 4 * R);
+  return (a & 0x0E000E00u) | (b & 0x80008000u);
+}
+
+struct Chunk3 {
+  uint4 w[KCH];
+  uint2 sc[KCH];
+};
+
+template <int POLICY>
+__device__ __forceinline__ uint2 ld_u2(const uint2* p) {
+  if constexpr (POLICY == 0) return __ldcs(p);
+  else return __ldcg(p);
+}
+
+template <int POLICY>
+__device__ __forceinline__ uint4 ld_w3(const uint4* p) {
+  if constexpr (POLICY == 0) return __ldcs(p);
+  else return __ldcg(p);
+}
+
+template <int POLICY>
+__device__ __forceinline__ void load_chunk3(Chunk3& ch, const MatDesc3& d, int nt, int kc, int lane) {
+  const int KT = d.K / 64, g = lane >> 2;
+  const uint8_t* W = reinterpret_cast<const uint8_t*>(d.W);
+  const uint8_t* S = reinterpret_cast<const uint8_t*>(d.S);
+#pragma unroll
+  for (int i = 0; i < KCH; ++i) {
+    const size_t tile = (size_t)nt * KT + kc * KCH + i;
+    ch.w[i] = ld_w3<POLICY>(reinterpret_cast<const uint4*>(W + tile * 512) + lane);
+    ch.sc[i] = ld_u2<POLICY>(reinterpret_cast<const uint2*>(S + tile * 64) + g);
+  }
+}
+
+template <int NTOK, int MATH>
+__device__ __forceinline__ void compute_chunk3(const Chunk3& ch, float (&acc)[NTOK][4], const __half* Xs, int Kp,
+                                               int kc, int lane) {
+  const int g = lane >> 2, c = lane & 3;
+  if constexpr (MATH == 0) {  // touch the data only: isolates memory + sync cost
+#pragma unroll
+    for (int i = 0; i < KCH; ++i)
+      acc[0][0] += __uint_as_float((ch.w[i].x ^ ch.w[i].y ^ ch.w[i].z ^ ch.w[i].w ^ ch.sc[i].x) & 0x007FFFFFu);
+    return;
+  }
+  const __half2 k128 = __float2half2_rn(128.f);
+#pragma unroll
+  for (int i = 0; i < KCH; ++i) {
+    const uint32_t words[4] = {ch.w[i].x, ch.w[i].y, ch.w[i].z, ch.w[i].w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint32_t pair = ((j < 2 ? ch.sc[i].x : ch.sc[i].y) >> (16 * (j & 1))) & 0xFFFFu;
+      __half2_raw sr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)pair, __NV_E4M3);
+      const __half2 s = __hmul2(__half2(sr), k128);  // (s_g, s_g8) * 2^7, exact
+      const __half2 s0 = __low2half2(s), s1 = __high2half2(s);
+      const uint32_t u = words[j];
+      uint32_t a[4];
+      uint32_t v;
+      __half2 h;
+      v = fp4_pair<0>(u); h = __hmul2(*reinterpret_cast<__half2*>(&v), s0); a[0] = *reinterpret_cast<uint32_t*>(&h);
+      v = fp4_pair<1>(u); h = __hmul2(*reinterpret_cast<__half2*>(&v), s1); a[1] = *reinterpret_cast<uint32_t*>(&h);
+      v = fp4_pair<2>(u); h = __hmul2(*reinterpret_cast<__half2*>(&v), s0); a[2] = *reinterpret_cast<uint32_t*>(&h);
+      v = fp4_pair<3>(u); h = __hmul2(*reinterpret_cast<__half2*>(&v), s1); a[3] = *reinterpret_cast<uint32_t*>(&h);
+      const int blk = (kc * KCH + i) * 4 + j;
+#pragma unroll
+      for (int t = 0; t < NTOK; ++t) {
+        const uint2 b = *reinterpret_cast<const uint2*>(Xs + (t * 8 + g) * Kp + blk * 16 + c * 4);
+        mma_16816(acc[t], a, b.x, b.y);
+      }
+    }
+  }
+}
+
+template <int NTOK>
+__device__ __forceinline__ void flush3(float (&acc)[NTOK][4], const MatDesc3& d, int nt, int M, int lane, float scale) {
+  const int g = lane >> 2, c = lane & 3;
+  float* Y = reinterpret_cast<float*>(d.Y);
+  const int N = d.N, r0 = nt * 16 + g, r1 = r0 + 8;
+#pragma unroll
+  for (int t = 0; t < NTOK; ++t) {
+    const int t0 = t * 8 + 2 * c, t1 = t0 + 1;
+    if (r0 < N) {
+      if (t0 < M) atomicAdd(Y + (size_t)t0 * N + r0, acc[t][0] * scale);
+      if (t1 < M) atomicAdd(Y + (size_t)t1 * N + r0, acc[t][1] * scale);
+    }
+    if (r1 < N) {
+      if (t0 < M) atomicAdd(Y + (size_t)t0 * N + r1, acc[t][2] * scale);
+      if (t1 < M) atomicAdd(Y + (size_t)t1 * N + r1, acc[t][3] * scale);
+    }
+  }
+}
+
+// One vectorized round trip: every thread issues all its 16-byte loads, then
+// scatters them into the permuted shared-memory layout. Rows >= M are zeroed.
+template <int NTOK>
+__device__ __forceinline__ void load_x3(__half* xs, const __half* __restrict__ X, int M, int K, int Kp) {
+  constexpr int ROWS = NTOK * 8;
+  constexpr int MAXV = ROWS / 2;  // ROWS * (2048 / 8) / V3_THREADS
+  const int per_row = K / 8;
+  const int total = ROWS * per_row;
+  uint4 v[MAXV];
+#pragma unroll
+  for (int u = 0; u < MAXV; ++u) {
+    const int idx = threadIdx.x + u * V3_THREADS;
+    v[u] = make_uint4(0u, 0u, 0u, 0u);
+    if (idx < total) {
+      const int r = idx / per_row, q = idx - r * per_row;
+      if (r < M) v[u] = __ldcg(reinterpret_cast<const uint4*>(X + (size_t)r * K) + q);
+    }
+  }
+#pragma unroll
+  for (int u = 0; u < MAXV; ++u) {
+    const int idx = threadIdx.x + u * V3_THREADS;
+    if (idx < total) {
+      const int r = idx / per_row, q = idx - r * per_row;
+      const int k = q * 8;
+      uint32_t* dst = reinterpret_cast<uint32_t*>(xs + r * Kp + (k >> 4) * 16 + ((k >> 3) & 1) * 2);
+      dst[0] = v[u].x;  // halves (2c, 2c+1) of this 8-run -> position c*4 (+2 for the upper run)
+      dst[2] = v[u].y;
+      dst[4] = v[u].z;
+      dst[6] = v[u].w;
+    }
+  }
+}
+
+__device__ __forceinline__ void decode3(const MatDesc3* sm, const StageDesc3& sd, int t, int& mi, int& nt, int& kc0,
+                                        int& n) {
+  int i = sd.m0;
+  while (i + 1 < sd.m1 && sm[i + 1].task_off <= t) ++i;
+  const MatDesc3& d = sm[i];
+  const int local = t - d.task_off;
+  nt = local / d.splits;
+  kc0 = (local - nt * d.splits) * sd.nkc;
+  n = min(sd.nkc, d.kchunks - kc0);
+  mi = i;
+}
+
+__device__ __forceinline__ long long globaltimer() {
+  long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+template <int NTOK, int POLICY, int MATH>
+__global__ void __launch_bounds__(V3_THREADS, 1) stream3_kernel(const MatDesc3* __restrict__ gm,
+                                                                const StageDesc3* __restrict__ gs, int n_mats,
+                                                                int n_stages, int M, int iters, float out_scale,
+                                                                long long* __restrict__ prof) {
+  __shared__ MatDesc3 sm[V3_MAXMATS];
+  __shared__ StageDesc3 ss[V3_MAXSTAGES];
+  extern __shared__ __align__(16) __half xs[];
+  for (int i = threadIdx.x; i < n_mats; i += blockDim.x) sm[i] = gm[i];
+  for (int i = threadIdx.x; i < n_stages; i += blockDim.x) ss[i] = gs[i];
+  __syncthreads();
+  cg::grid_group grid = cg::this_grid();
+  const int lane = threadIdx.x & 31;
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int nwarps = (gridDim.x * blockDim.x) >> 5;
+  const bool rec = prof != nullptr && threadIdx.x == 0;
+  if (rec && blockIdx.x == 0) {
+    prof[0] = clock64();
+    prof[1] = globaltimer();
+  }
+  for (int it = 0; it < iters; ++it) {
+    // position of this warp's current chunk: stage s, j-th task of the warp in s, chunk c
+    int s = 0, j = 0, c = 0;
+    while (s < n_stages && warp >= ss[s].total) ++s;
+    bool valid = s < n_stages;
+    int mi = 0, nt = 0, kc0 = 0, n = 0;
+    Chunk3 cur, nxt;
+    if (valid) {
+      decode3(sm, ss[s], warp, mi, nt, kc0, n);
+      load_chunk3<POLICY>(cur, sm[mi], nt, kc0, lane);
+    }
+    float acc[NTOK][4];
+    for (int st = 0; st < n_stages; ++st) {
+      const long long t0 = clock64();
+      const MatDesc3& first = sm[ss[st].m0];
+      const int K = first.K, Kp = K + 16;
+      load_x3<NTOK>(xs, reinterpret_cast<const __half*>(first.X), M, K, Kp);
+      __syncthreads();
+      const long long t1 = clock64();
+      while (valid && s == st) {
+        if (c == 0) {
+#pragma unroll
+          for (int t = 0; t < NTOK; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+        }
+        // next chunk: same task, next task of this warp, or a later stage
+        int s2 = s, j2 = j, c2 = c + 1, mi2 = mi, nt2 = nt, kc02 = kc0, n2 = n;
+        if (c2 >= n) {
+          c2 = 0;
+          ++j2;
+          while (s2 < n_stages && warp + j2 * nwarps >= ss[s2].total) {
+            ++s2;
+            j2 = 0;
+          }
+          if (s2 < n_stages) decode3(sm, ss[s2], warp + j2 * nwarps, mi2, nt2, kc02, n2);
+        }
+        const bool valid2 = s2 < n_stages;
+        if (valid2) load_chunk3<POLICY>(nxt, sm[mi2], nt2, kc02 + c2, lane);
+        compute_chunk3<NTOK, MATH>(cur, acc, xs, Kp, kc0 + c, lane);
+        if (c + 1 >= n) flush3<NTOK>(acc, sm[mi], nt, M, lane, out_scale);
+        cur = nxt;
+        s = s2; j = j2; c = c2; mi = mi2; nt = nt2; kc0 = kc02; n = n2;
+        valid = valid2;
+      }
+      if (prof != nullptr && it == 0) {  // uniform per launch, so every thread takes this branch
+        __syncthreads();                 // whole block done with this stage
+        if (rec) {
+          long long* p = prof + 4 + ((long long)st * gridDim.x + blockIdx.x) * 3;
+          p[0] = t0;
+          p[1] = t1;
+          p[2] = clock64();
+        }
+      }
+      grid.sync();
+    }
+  }
+  if (rec && blockIdx.x == 0) {
+    prof[2] = clock64();
+    prof[3] = globaltimer();
+  }
+}
+
+template <int NTOK, int POLICY, int MATH>
+static void* s3fn() {
+  return (void*)stream3_kernel<NTOK, POLICY, MATH>;
+}
+
+static void* pick_stream3(int ntok, int policy, int math) {
+  if (ntok == 1) {
+    if (policy == 0) return math ? s3fn<1, 0, 1>() : s3fn<1, 0, 0>();
+    return math ? s3fn<1, 1, 1>() : s3fn<1, 1, 0>();
+  }
+  if (policy == 0) return math ? s3fn<2, 0, 1>() : s3fn<2, 0, 0>();
+  return math ? s3fn<2, 1, 1>() : s3fn<2, 1, 0>();
+}
+
+static double launch_stream3(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax,
+                             int64_t policy, int64_t math, double out_scale, torch::Tensor prof, bool timed) {
+  TORCH_CHECK(descs.is_cuda() && descs.scalar_type() == torch::kInt64 && descs.size(1) == 7);
+  TORCH_CHECK(stages.is_cuda() && stages.scalar_type() == torch::kInt32 && stages.size(1) == 4);
+  TORCH_CHECK(descs.size(0) <= V3_MAXMATS && stages.size(0) <= V3_MAXSTAGES);
+  TORCH_CHECK(M >= 1 && M <= 16 && (policy == 0 || policy == 1));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int dev = 0, sms = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  const int ntok = M <= 8 ? 1 : 2;
+  const int smem = ntok * 8 * ((int)kmax + 16) * (int)sizeof(__half);
+  void* fn = pick_stream3(ntok, (int)policy, (int)math);
+  const MatDesc3* gm = reinterpret_cast<const MatDesc3*>(descs.data_ptr<int64_t>());
+  const StageDesc3* gs = reinterpret_cast<const StageDesc3*>(stages.data_ptr<int>());
+  int nm = (int)descs.size(0), ns = (int)stages.size(0), m = (int)M, its = (int)iters;
+  float sc = (float)out_scale;
+  long long* pp = prof.numel() > 0 ? reinterpret_cast<long long*>(prof.data_ptr<int64_t>()) : nullptr;
+  void* args[] = {&gm, &gs, &nm, &ns, &m, &its, &sc, &pp};
+  CUDA_OK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  if (!timed) {
+    CUDA_OK(cudaLaunchCooperativeKernel(fn, dim3(sms), dim3(V3_THREADS), args, smem, stream));
+    return 0.0;
+  }
+  EventTimer t(stream);
+  t.start();
+  CUDA_OK(cudaLaunchCooperativeKernel(fn, dim3(sms), dim3(V3_THREADS), args, smem, stream));
+  return t.stop_ms();
+}
+
+void run_stream3(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t kmax, int64_t policy, int64_t math,
+                 double out_scale, torch::Tensor prof) {
+  launch_stream3(descs, stages, M, 1, kmax, policy, math, out_scale, prof, false);
+}
+
+double time_stream3(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax, int64_t policy,
+                    int64_t math) {
+  auto none = torch::empty({0}, descs.options());
+  launch_stream3(descs, stages, M, 1, kmax, policy, math, 1.0, none, false);  // warm-up
+  return launch_stream3(descs, stages, M, iters, kmax, policy, math, 1.0, none, true);
+}

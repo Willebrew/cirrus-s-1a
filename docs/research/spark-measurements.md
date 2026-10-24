@@ -98,14 +98,49 @@ artifact.
 stay resident across decode steps, a model whose per-step weights fit (≈110M params at NVFP4,
 or 155M at ~3 bits) could stream at several times DRAM speed.
 
-## Run 3 (pending): kernel v2 + cache probes
+## Run 3 (2026-10-24): kernel v2 + cache probes
 
-`scripts/bench_spark.py --only decode_stream_v2 cache_resident_stream cache_probe model_smoke_test`
+Built cleanly; all checks passed (v2 stream 3.5e-7); 35/35 tests.
 
-- **v2 pipelined persistent stream:** each warp always has its next chunk of weight loads in
-  flight, across task *and* stage boundaries, so DRAM never idles at a barrier. Split-K is sized
-  per stage (46,767 tasks for the full step versus ~89K chunks before), which also cuts atomics.
-  The traversal was verified offline (every chunk computed once, every task flushed once).
-- **Cache-policy variants:** evict-first (`.cs`), L2 (`.cg`) and read-only (`.nc`) loads.
-- **Cache-resident test:** streams the first 16/32/48/64/80 MB of the model back to back.
-- **Cache probes:** rotating-offset read sweep, and dependent-load latency vs. working set.
+**v2 was slower than v1:** 696 µs at M=1 with its best hint (evict-first), versus 638 µs for v1.
+The L2 hint (`.cg`) was 4-7% slower on the full 91 MB step.
+
+**The cache-resident test shows the real problem.** Even a 15.6 MB, 15-stage slice of the
+model, which fits in L2, streamed at only 194 GB/s (`.cg`) versus 1,864 GB/s for a plain read
+of the same size: about **5.4 µs per stage with no DRAM involved**. The kernel is
+latency-bound in its own control path:
+1. **Dependent global loads per chunk.** v2 reads the task table, then the matrix descriptor,
+   then issues the weight load: two ~140 ns round trips (pointer-chase latency) before the
+   prefetch even starts, and the warp stalls on them ahead of its math.
+2. **`load_x` is serialized.** 6-16 iterations per thread, each store waiting on its load:
+   ≈1-2 µs per stage.
+3. **Dequant instruction count** (~61 instructions per 32-bit weight word) lengthens each
+   stage's critical path.
+
+**The cache is about 32 MB, not 64 MB.** The rotating-offset read holds 1.65-1.86 TB/s up to
+32 MB, then drops to 718 GB/s at 40 MB and DRAM speed by 80 MB. That's consistent with the
+documented 24 MB L2 plus 16 MB SLC. The plain sweep's 64 MB plateau was flattered by
+per-thread reuse. Dependent-load latency is a flat ~140 ns from 0.25 MB to 256 MB, so on this
+part an L2 hit and a DRAM access cost about the same *latency*; caches help bandwidth, not
+latency. That's another reason latency chains are so costly here.
+
+**Consequences for the design:**
+- Cache residency of all the weights is off the table at any sensible size, but the L2 hint
+  does pay off for data that truly fits (16 MB slice: 194 vs 140 GB/s). It suits the shared
+  KV/top-k rows and the MTP head, which the roofline already assumes are L2-resident.
+- Per-stage latency is the critical engineering problem. The real engine has ~95 dependent
+  stages per step (norms and activations fold into activation loads, plus GDN/attention cores).
+
+## Run 4 (pending): kernel v3 + per-stage profiling
+
+`scripts/bench_spark.py --only decode_stream_v3 model_smoke_test`
+
+- Descriptors in shared memory with arithmetic task decode: no global round trip before a
+  chunk's loads issue.
+- One vectorized round trip for activations, into a permuted layout (one 64-bit LDS per mma).
+- Leaner dequant: 4 ALU ops per fp16 pair; block scales converted two at a time and pre-scaled
+  by 2^7, which keeps products exact in fp16 (verified bit-exact in a numpy emulation across
+  the full E4M3 range).
+- A `no-math` variant isolates the memory + barrier skeleton.
+- **In-kernel `clock64` stamps per stage and block**, reporting activation-load, compute
+  (max and median across SMs), and barrier/imbalance time, plus the slowest stages.
