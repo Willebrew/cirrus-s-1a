@@ -108,3 +108,24 @@ lean recipe instead:
 - **Risks:** a consumer card running for weeks (no ECC; checkpoint often), WSL2 if the 4090 is
   in a Windows machine (Triton needs Linux; WSL2 works), and 200B tokens being enough for
   multi-source reasoning at 155M. The ablations test that before the long run.
+
+## Renting vs. the 4090, by plan size
+
+Training-token equivalents include 18B of ablations, 25B of mid-training at 60% efficiency, and
+1.5B of SFT. Rented figures use the same per-H100 throughput, price and contingency as the
+three scenarios above (optimistic / base / conservative). GPU cost only: teacher data stays
+on the Sparks.
+
+| plan | rented GPU-h | rented cost | 8×H100 node | 32×H100 | one 4090 (40-70K tok/s) |
+|---|---|---|---|---|---|
+| lean, 200B pretrain | 249 / **377** / 677 | $547 / **$1,094** / $2,708 | 1.3-3.5 days | 8-21 h | **43-76 days** |
+| middle, 500B | 534 / **811** / 1,455 | $1,176 / **$2,351** / $5,820 | 2.8-7.6 days | 17-46 h | 93-162 days |
+| full, 1.5T | 1,487 / **2,255** / 4,047 | $3,271 / **$6,540** / $16,190 | 7.7-21 days | 2-5 days | 258-452 days |
+
+Per GPU, an H100 is ~4-6× a 4090 for this model (250K vs 40-70K tok/s, both estimates until
+`scripts/bench_train.py` measures them). An 8×H100 node is ~35× the 4090.
+
+**Recommended hybrid:** run the ablations on the 4090 (free, ~3-5 days, no time pressure),
+then rent one 8×H100 node for the main pretraining run. The lean plan costs ~$1.1k and takes
+~2 days; the 500B middle plan ~$2.4k and ~4 days. Before booking, measure real throughput with
+`bench_train.py` on one rented H100 for an hour (~$3-4).
