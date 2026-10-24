@@ -131,16 +131,39 @@ latency. That's another reason latency chains are so costly here.
 - Per-stage latency is the critical engineering problem. The real engine has ~95 dependent
   stages per step (norms and activations fold into activation loads, plus GDN/attention cores).
 
-## Run 4 (pending): kernel v3 + per-stage profiling
+## Run 4 (2026-10-24): kernel v3, first pass over 3,000 tok/s
 
-`scripts/bench_spark.py --only decode_stream_v3 model_smoke_test`
+Built cleanly; v3 correctness 4.1e-7; 35/35 tests.
 
-- Descriptors in shared memory with arithmetic task decode: no global round trip before a
-  chunk's loads issue.
-- One vectorized round trip for activations, into a permuted layout (one 64-bit LDS per mma).
-- Leaner dequant: 4 ALU ops per fp16 pair; block scales converted two at a time and pre-scaled
-  by 2^7, which keeps products exact in fp16 (verified bit-exact in a numpy emulation across
-  the full E4M3 range).
-- A `no-math` variant isolates the memory + barrier skeleton.
-- **In-kernel `clock64` stamps per stage and block**, reporting activation-load, compute
-  (max and median across SMs), and barrier/imbalance time, plus the slowest stages.
+| M | 1 | 2 | 4 | 8 | 13 |
+|---|---|---|---|---|---|
+| v1 persistent (run 2) | 638 µs | 656 | 687 | 773 | 1,042 |
+| **v3, `.cs`** | **546 µs (166 GB/s)** | 554 | 572 | 567 | 748 |
+| v3, `.cg` | 563 | 576 | 594 | 631 | 824 |
+| v3, `.cs` **no math** | 547 | 555 | 565 | 582 | 722 |
+
+**Decode estimate from the measured stream: 3,131 tok/s at τ=2.0 (verify 4) and 3,945 at
+τ=2.5 (verify 8), 32K context. That's the first configuration over 3,000.** τ=1.65 gives 2,583.
+
+**Arithmetic is no longer the limit:** removing all dequant and tensor-core math changes the
+time by <1% for M ≤ 4.
+
+Per-stage profile (M=1, `clock64` stamps): 563.7 µs = 96.2 µs activation load + 424.7 µs
+compute (slowest SM) + 50.5 µs barrier/imbalance.
+- **Big stages stream near peak:** `lm_head` (14.2 MB) at ~234 GB/s during compute, and
+  `ffn.gate_up` (1.77 MB) at ~221 GB/s.
+- **Stage boundaries cost ≈1.7 µs each** (1.06 µs activation load + 0.65 µs barrier), ≈133 µs per
+  step. (546 − 133) µs × ~225 GB/s ≈ 93 MB, i.e. DRAM is effectively idle during the gaps.
+- **Small stages run on 18 of 48 SMs.** For the 0.33 MB output projections, the median block's
+  compute is 0.07 µs: warp-major task placement put their 288 tasks on the first 18 SMs. An
+  offline emulation reproduces exactly this.
+
+## Run 5 (pending): kernel v4, placement × prefetch depth
+
+`scripts/bench_spark.py --only decode_stream_v4 model_smoke_test`
+
+- `rr=1`: round-robin task placement over blocks, so every stage spreads over all 48 SMs
+  (offline emulation: minimum busy SMs per stage goes from 18 to 48).
+- Prefetch depth D=1/2/3 (register shift ring), so DRAM keeps streaming later stages' weights
+  through the barrier gaps.
+- The full grid is timed, and the best configuration is profiled per stage at M=1 and M=4.

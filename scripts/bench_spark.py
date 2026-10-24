@@ -145,6 +145,8 @@ double time_read_rot(torch::Tensor buf, int64_t iters, int64_t blocks, int64_t t
 double time_chase(torch::Tensor next, int64_t start, int64_t hops);
 void run_stream3(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t kmax, int64_t policy, int64_t math, double out_scale, torch::Tensor prof);
 double time_stream3(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax, int64_t policy, int64_t math);
+void run_stream4(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t kmax, int64_t depth, int64_t rr, double out_scale, torch::Tensor prof);
+double time_stream4(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax, int64_t depth, int64_t rr);
 """
     log(f"   building CUDA kernels for sm_{major}{minor} (first run takes ~1 min)...")
     return load_inline(
@@ -153,7 +155,7 @@ double time_stream3(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_
         cuda_sources=src,
         functions=["time_read", "time_coop_barrier", "time_flag_barrier", "nvfp4_gemv", "nvfp4_mma_gemv",
                    "run_stream", "time_stream", "run_stream2", "time_stream2", "time_read_rot", "time_chase",
-                   "run_stream3", "time_stream3"],
+                   "run_stream3", "time_stream3", "run_stream4", "time_stream4"],
         extra_cuda_cflags=["-O3", "-lineinfo"],
         verbose=False,
     )
@@ -706,13 +708,17 @@ def stream_v3_correctness(ext) -> dict:
     return {"max_rel_err": worst}
 
 
-def profile_stream3(ext, st, M: int, stages, policy: int) -> dict:
-    """Per-stage breakdown from in-kernel clock64 stamps (first iteration)."""
+def profile_stream3(ext, st, M: int, stages, policy: int, runner=None) -> dict:
+    """Per-stage breakdown from in-kernel clock64 stamps (first iteration).
+    ``runner(prof)`` launches the kernel to profile (default: v3)."""
     nb = torch.cuda.get_device_properties(0).multi_processor_count
     ns = len(stages)
     prof = torch.zeros(4 + ns * nb * 3, dtype=torch.int64, device="cuda")
     st["Y"].zero_()
-    ext.run_stream3(st["descs"], st["stages"], M, st["kmax"], policy, 1, 1.0, prof)
+    if runner is None:
+        ext.run_stream3(st["descs"], st["stages"], M, st["kmax"], policy, 1, 1.0, prof)
+    else:
+        runner(prof)
     torch.cuda.synchronize()
     p = prof.cpu()
     cyc_per_ns = (p[2] - p[0]).item() / max(1, (p[3] - p[1]).item())
@@ -772,6 +778,77 @@ def decode_stream_v3(ext) -> dict:
         del st
     for m in (1, 2, 4, 8, 13):
         out[f"persistent_M{m}_us"] = min(out[f"p0_M{m}_us"], out[f"p1_M{m}_us"])
+    return out
+
+
+# ------------------------------------- v4: placement + prefetch-depth sweep
+def v4_depths(m: int):
+    return (1, 2, 3) if m <= 8 else (1, 2)
+
+
+@section("stream_v4_correctness")
+def stream_v4_correctness(ext) -> dict:
+    gen = torch.Generator(device="cuda").manual_seed(9)
+    stages = [[("a", 768, 768), ("b", 12, 768)], [("c", 768, 2048)], [("d", 4096, 768)], [("e", 64, 1536)]]
+    worst = 0.0
+    empty = torch.empty(0, dtype=torch.int64, device="cuda")
+    for m in (1, 5, 13):
+        st = build_stream3(stages, m, gen, nwarps_total(), keep_ref=True)
+        for depth in v4_depths(m):
+            for rr in (0, 1):
+                st["Y"].zero_()
+                ext.run_stream4(st["descs"], st["stages"], m, st["kmax"], depth, rr, 128.0, empty)
+                torch.cuda.synchronize()
+                for y, ref in st["refs"]:
+                    worst = max(worst, ((y.view_as(ref) - ref).abs().max() / ref.abs().max()).item())
+    ok = worst < 1e-3
+    log(f"   v4 stream max rel err (depth 1-3, both placements, M=1/5/13): {worst:.2e} -> {'OK' if ok else 'MISMATCH'}")
+    if not ok:
+        raise AssertionError(f"stream4 mismatch: {worst}")
+    return {"max_rel_err": worst}
+
+
+@section("decode_stream_v4")
+def decode_stream_v4(ext) -> dict:
+    from cirrus.perf.shapes import decode_stages
+
+    cfg = get_config("cirrus-s-1a")
+    stages = decode_stages(cfg)
+    gen = torch.Generator(device="cuda").manual_seed(10)
+    out = {"n_stages": len(stages)}
+    iters = 50
+    for m in (1, 2, 4, 8, 13):
+        st = build_stream3(stages, m, gen, nwarps_total())
+        out["weight_mb"] = round(st["bytes"] / 1e6, 1)
+        line, best = [f"   M={m:2d}:"], None
+        for rr in (0, 1):
+            for depth in v4_depths(m):
+                ms = min(ext.time_stream4(st["descs"], st["stages"], m, iters, st["kmax"], depth, rr) for _ in range(3))
+                us = ms * 1e3 / iters
+                key = f"rr{rr}_d{depth}_M{m}"
+                out[f"{key}_us"] = round(us, 1)
+                out[f"{key}_gbps"] = round(st["bytes"] / (us * 1e-6) / 1e9, 1)
+                line.append(f"{'rr' if rr else 'wm'} d{depth} {us:6.1f}")
+                if best is None or us < best[0]:
+                    best = (us, rr, depth)
+        out[f"persistent_M{m}_us"] = round(best[0], 1)
+        out[f"best_M{m}"] = {"us": round(best[0], 1), "rr": best[1], "depth": best[2],
+                             "gbps": round(st["bytes"] / (best[0] * 1e-6) / 1e9, 1)}
+        log(" | ".join(line) + f"   -> best {'rr' if best[1] else 'wm'} d{best[2]}: "
+            f"{best[0]:.1f} us ({out[f'best_M{m}']['gbps']} GB/s)")
+        if m in (1, 4):
+            _, rr, depth = best
+            prof = profile_stream3(ext, st, m, stages, 0, runner=lambda pr: ext.run_stream4(
+                st["descs"], st["stages"], m, st["kmax"], depth, rr, 1.0, pr))
+            out[f"profile_M{m}"] = prof
+            s = prof["summary"]
+            log(f"      profile M={m} ({'rr' if rr else 'wm'} d{depth}): stages {s['total_us']} us = x-load "
+                f"{s['xload_us']} + compute(max) {s['compute_max_us']} [median {s['compute_med_us']}] "
+                f"+ barrier/imbalance {s['barrier_and_imbalance_us']}")
+            for r in prof["slowest"][:5]:
+                log(f"        slow: {r['stage'][:40]:40s} {r['mb']:6.2f} MB span {r['span_us']:6.2f} us "
+                    f"(x {r['xload_us']}, compute max {r['compute_max_us']}, med {r['compute_med_us']}, wait {r['wait_us']})")
+        del st
     return out
 
 
@@ -925,6 +1002,8 @@ def main() -> None:
         stream = decode_stream_v2(ext) or stream
     if ext and want("decode_stream_v3") and stream_v3_correctness(ext) is not None:
         stream = decode_stream_v3(ext) or stream
+    if ext and want("decode_stream_v4") and stream_v4_correctness(ext) is not None:
+        stream = decode_stream_v4(ext) or stream
     if ext and want("cache_resident_stream"):
         cache_resident_stream(ext)
     if ext and want("cache_probe"):

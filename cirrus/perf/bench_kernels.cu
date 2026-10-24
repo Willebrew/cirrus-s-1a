@@ -1043,3 +1043,206 @@ double time_stream3(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_
   launch_stream3(descs, stages, M, 1, kmax, policy, math, 1.0, none, false);  // warm-up
   return launch_stream3(descs, stages, M, iters, kmax, policy, math, 1.0, none, true);
 }
+
+// ======================================================================
+// v4: round-robin placement + D-deep prefetch ring
+// ======================================================================
+// Run 4 (v3) profile: big stages stream at ~225-234 GB/s while computing, but
+// ~1.7 us per stage boundary (activation load + barrier) leaves DRAM idle,
+// and small stages run on only the first SMs (warp-major task placement put
+// 288 tasks on 18 of 48 SMs). v4 changes exactly two things, both measurable:
+//   * placement: rr=1 maps task slots round-robin over blocks first, so every
+//     stage spreads across all SMs
+//   * prefetch depth D: each warp keeps D chunks of weight loads in flight
+//     (a register shift ring), reaching across stage boundaries so DRAM keeps
+//     streaming through barrier gaps
+// Layout, dequant and tables are identical to v3.
+
+struct Meta4 {
+  int st, mi, nt, kc;
+  bool first, last;
+};
+
+struct Cursor4 {
+  int s, j, c, mi, nt, kc0, n;
+  bool valid;
+};
+
+__device__ __forceinline__ void cursor4_decode(Cursor4& cu, const MatDesc3* sm, const StageDesc3* ss, int slot,
+                                               int nwarps) {
+  decode3(sm, ss[cu.s], slot + cu.j * nwarps, cu.mi, cu.nt, cu.kc0, cu.n);
+}
+
+__device__ __forceinline__ void cursor4_init(Cursor4& cu, const MatDesc3* sm, const StageDesc3* ss, int ns, int slot,
+                                             int nwarps) {
+  cu.s = 0;
+  cu.j = 0;
+  cu.c = 0;
+  while (cu.s < ns && slot >= ss[cu.s].total) ++cu.s;
+  cu.valid = cu.s < ns;
+  if (cu.valid) cursor4_decode(cu, sm, ss, slot, nwarps);
+}
+
+__device__ __forceinline__ void cursor4_next(Cursor4& cu, const MatDesc3* sm, const StageDesc3* ss, int ns, int slot,
+                                             int nwarps) {
+  if (++cu.c < cu.n) return;
+  cu.c = 0;
+  ++cu.j;
+  while (cu.s < ns && slot + cu.j * nwarps >= ss[cu.s].total) {
+    ++cu.s;
+    cu.j = 0;
+  }
+  cu.valid = cu.s < ns;
+  if (cu.valid) cursor4_decode(cu, sm, ss, slot, nwarps);
+}
+
+__device__ __forceinline__ Meta4 cursor4_meta(const Cursor4& cu) {
+  Meta4 m;
+  m.st = cu.s;
+  m.mi = cu.mi;
+  m.nt = cu.nt;
+  m.kc = cu.kc0 + cu.c;
+  m.first = cu.c == 0;
+  m.last = cu.c + 1 >= cu.n;
+  return m;
+}
+
+template <int NTOK, int D>
+__global__ void __launch_bounds__(V3_THREADS, 1) stream4_kernel(const MatDesc3* __restrict__ gm,
+                                                                const StageDesc3* __restrict__ gs, int n_mats,
+                                                                int n_stages, int M, int iters, float out_scale,
+                                                                int rr, long long* __restrict__ prof) {
+  __shared__ MatDesc3 sm[V3_MAXMATS];
+  __shared__ StageDesc3 ss[V3_MAXSTAGES];
+  extern __shared__ __align__(16) __half xs[];
+  for (int i = threadIdx.x; i < n_mats; i += blockDim.x) sm[i] = gm[i];
+  for (int i = threadIdx.x; i < n_stages; i += blockDim.x) ss[i] = gs[i];
+  __syncthreads();
+  cg::grid_group grid = cg::this_grid();
+  const int lane = threadIdx.x & 31;
+  const int lw = threadIdx.x >> 5;
+  const int nwarps = (gridDim.x * blockDim.x) >> 5;
+  const int slot = rr ? (int)(blockIdx.x + gridDim.x * lw) : (int)(blockIdx.x * (blockDim.x >> 5) + lw);
+  const bool rec = prof != nullptr && threadIdx.x == 0;
+  if (rec && blockIdx.x == 0) {
+    prof[0] = clock64();
+    prof[1] = globaltimer();
+  }
+  for (int it = 0; it < iters; ++it) {
+    Cursor4 cu;
+    cursor4_init(cu, sm, ss, n_stages, slot, nwarps);
+    Chunk3 buf[D];
+    Meta4 meta[D];
+    bool ok[D];
+#pragma unroll
+    for (int d = 0; d < D; ++d) {
+      ok[d] = cu.valid;
+      if (cu.valid) {
+        load_chunk3<0>(buf[d], sm[cu.mi], cu.nt, cu.kc0 + cu.c, lane);
+        meta[d] = cursor4_meta(cu);
+        cursor4_next(cu, sm, ss, n_stages, slot, nwarps);
+      }
+    }
+    float acc[NTOK][4];
+    for (int st = 0; st < n_stages; ++st) {
+      const long long t0 = clock64();
+      const MatDesc3& first = sm[ss[st].m0];
+      const int K = first.K, Kp = K + 16;
+      load_x3<NTOK>(xs, reinterpret_cast<const __half*>(first.X), M, K, Kp);
+      __syncthreads();
+      const long long t1 = clock64();
+      while (ok[0] && meta[0].st == st) {
+        Chunk3 tmp;
+        Meta4 tm;
+        const bool tv = cu.valid;
+        if (tv) {  // keep D chunks in flight: issue the next one before computing
+          load_chunk3<0>(tmp, sm[cu.mi], cu.nt, cu.kc0 + cu.c, lane);
+          tm = cursor4_meta(cu);
+          cursor4_next(cu, sm, ss, n_stages, slot, nwarps);
+        }
+        if (meta[0].first) {
+#pragma unroll
+          for (int t = 0; t < NTOK; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+        }
+        compute_chunk3<NTOK, 1>(buf[0], acc, xs, Kp, meta[0].kc, lane);
+        if (meta[0].last) flush3<NTOK>(acc, sm[meta[0].mi], meta[0].nt, M, lane, out_scale);
+#pragma unroll
+        for (int d = 0; d + 1 < D; ++d) {
+          buf[d] = buf[d + 1];
+          meta[d] = meta[d + 1];
+          ok[d] = ok[d + 1];
+        }
+        buf[D - 1] = tmp;
+        meta[D - 1] = tm;
+        ok[D - 1] = tv;
+      }
+      if (prof != nullptr && it == 0) {
+        __syncthreads();
+        if (rec) {
+          long long* p = prof + 4 + ((long long)st * gridDim.x + blockIdx.x) * 3;
+          p[0] = t0;
+          p[1] = t1;
+          p[2] = clock64();
+        }
+      }
+      grid.sync();
+    }
+  }
+  if (rec && blockIdx.x == 0) {
+    prof[2] = clock64();
+    prof[3] = globaltimer();
+  }
+}
+
+template <int NTOK, int D>
+static void* s4fn() {
+  return (void*)stream4_kernel<NTOK, D>;
+}
+
+static void* pick_stream4(int ntok, int depth) {
+  if (ntok == 1) return depth == 1 ? s4fn<1, 1>() : depth == 2 ? s4fn<1, 2>() : s4fn<1, 3>();
+  return depth == 1 ? s4fn<2, 1>() : s4fn<2, 2>();
+}
+
+static double launch_stream4(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax,
+                             int64_t depth, int64_t rr, double out_scale, torch::Tensor prof, bool timed) {
+  TORCH_CHECK(descs.is_cuda() && descs.scalar_type() == torch::kInt64 && descs.size(1) == 7);
+  TORCH_CHECK(stages.is_cuda() && stages.scalar_type() == torch::kInt32 && stages.size(1) == 4);
+  TORCH_CHECK(descs.size(0) <= V3_MAXMATS && stages.size(0) <= V3_MAXSTAGES);
+  TORCH_CHECK(M >= 1 && M <= 16);
+  const int ntok = M <= 8 ? 1 : 2;
+  TORCH_CHECK(depth >= 1 && depth <= (ntok == 1 ? 3 : 2), "depth: 1-3 for M <= 8, 1-2 for M > 8");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int dev = 0, sms = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  const int smem = ntok * 8 * ((int)kmax + 16) * (int)sizeof(__half);
+  void* fn = pick_stream4(ntok, (int)depth);
+  const MatDesc3* gm = reinterpret_cast<const MatDesc3*>(descs.data_ptr<int64_t>());
+  const StageDesc3* gs = reinterpret_cast<const StageDesc3*>(stages.data_ptr<int>());
+  int nm = (int)descs.size(0), ns = (int)stages.size(0), m = (int)M, its = (int)iters, r = (int)rr;
+  float sc = (float)out_scale;
+  long long* pp = prof.numel() > 0 ? reinterpret_cast<long long*>(prof.data_ptr<int64_t>()) : nullptr;
+  void* args[] = {&gm, &gs, &nm, &ns, &m, &its, &sc, &r, &pp};
+  CUDA_OK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  if (!timed) {
+    CUDA_OK(cudaLaunchCooperativeKernel(fn, dim3(sms), dim3(V3_THREADS), args, smem, stream));
+    return 0.0;
+  }
+  EventTimer t(stream);
+  t.start();
+  CUDA_OK(cudaLaunchCooperativeKernel(fn, dim3(sms), dim3(V3_THREADS), args, smem, stream));
+  return t.stop_ms();
+}
+
+void run_stream4(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t kmax, int64_t depth, int64_t rr,
+                 double out_scale, torch::Tensor prof) {
+  launch_stream4(descs, stages, M, 1, kmax, depth, rr, out_scale, prof, false);
+}
+
+double time_stream4(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax, int64_t depth,
+                    int64_t rr) {
+  auto none = torch::empty({0}, descs.options());
+  launch_stream4(descs, stages, M, 1, kmax, depth, rr, 1.0, none, false);  // warm-up
+  return launch_stream4(descs, stages, M, iters, kmax, depth, rr, 1.0, none, true);
+}

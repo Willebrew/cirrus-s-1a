@@ -1,0 +1,143 @@
+{
+  "sections": {
+    "environment": {
+      "host": "grace",
+      "device": "NVIDIA GB10",
+      "capability": "12.1",
+      "torch": "2.13.0+cu130",
+      "driver": "580.178.04",
+      "gpu_processes": ""
+    },
+    "stream_v3_correctness": {
+      "max_rel_err": 4.075097592703969e-07
+    },
+    "decode_stream_v3": {
+      "n_stages": 78,
+      "weight_mb": 90.8,
+      "p0_M1_us": 546.0,
+      "p0_M1_gbps": 166.4,
+      "p1_M1_us": 562.6,
+      "p1_M1_gbps": 161.5,
+      "p0_nomath_M1_us": 547.1,
+      "p0_nomath_M1_gbps": 166.0,
+      "p0_M2_us": 554.0,
+      "p0_M2_gbps": 164.0,
+      "p1_M2_us": 576.1,
+      "p1_M2_gbps": 157.7,
+      "p0_nomath_M2_us": 554.9,
+      "p0_nomath_M2_gbps": 163.7,
+      "p0_M4_us": 572.2,
+      "p0_M4_gbps": 158.8,
+      "p1_M4_us": 594.0,
+      "p1_M4_gbps": 152.9,
+      "p0_nomath_M4_us": 565.0,
+      "p0_nomath_M4_gbps": 160.8,
+      "p0_M8_us": 567.3,
+      "p0_M8_gbps": 160.1,
+      "p1_M8_us": 630.6,
+      "p1_M8_gbps": 144.1,
+      "p0_nomath_M8_us": 581.7,
+      "p0_nomath_M8_gbps": 156.2,
+      "p0_M13_us": 748.2,
+      "p0_M13_gbps": 121.4,
+      "p1_M13_us": 823.8,
+      "p1_M13_gbps": 110.3,
+      "p0_nomath_M13_us": 721.7,
+      "p0_nomath_M13_gbps": 125.9,
+      "profile_M1": {
+        "summary": {
+          "sm_ghz": 2.519,
+          "total_us": 563.7,
+          "xload_us": 96.2,
+          "compute_max_us": 424.7,
+          "compute_med_us": 315.7,
+          "barrier_and_imbalance_us": 50.5
+        },
+        "slowest": [
+          {
+            "stage": "lm_head",
+            "mb": 14.156,
+            "span_us": 62.31,
+            "xload_us": 1.06,
+            "compute_max_us": 60.55,
+            "compute_med_us": 59.38,
+            "wait_us": 0.77
+          },
+          {
+            "stage": "mtp.draft_head",
+            "mb": 3.539,
+            "span_us": 14.31,
+            "xload_us": 1.06,
+            "compute_max_us": 12.67,
+            "compute_med_us": 8.23,
+            "wait_us": 1.12
+          },
+          {
+            "stage": "self5.ffn.gate_up",
+            "mb": 1.769,
+            "span_us": 11.16,
+            "xload_us": 1.07,
+            "compute_max_us": 9.44,
+            "compute_med_us": 7.65,
+            "wait_us": 0.65
+          }
+        ],
+        "typical": {
+          "gdn.o (0.33 MB)": {
+            "span_us": 3.6,
+            "xload_us": 1.06,
+            "compute_max_us": 2.3,
+            "compute_med_us": 0.07
+          },
+          "ffn.gate_up (1.77 MB)": {
+            "span_us": 9.6,
+            "xload_us": 1.07,
+            "compute_max_us": 8.0,
+            "compute_med_us": 6.8
+          },
+          "ffn.down (0.89 MB)": {
+            "span_us": 6.6,
+            "xload_us": 1.74,
+            "compute_max_us": 4.3,
+            "compute_med_us": 3.3
+          }
+        },
+        "note": "full per-stage list kept on grace: results/local/spark-grace-20261024-134138.json"
+      },
+      "profile_M4": {
+        "summary": {
+          "sm_ghz": 2.522,
+          "total_us": 589.7,
+          "xload_us": 104.2,
+          "compute_max_us": 434.4,
+          "compute_med_us": 325.7,
+          "barrier_and_imbalance_us": 50.9
+        }
+      }
+    },
+    "model_smoke_test": {
+      "params": 155221100,
+      "incremental_rel_err": 6.749391559424112e-06
+    }
+  },
+  "errors": {},
+  "tests": "35 passed",
+  "tok_s_from_measured_stream": {
+    "tau1.0_verify1_ctx4096": 1669,
+    "tau1.0_verify1_ctx32768": 1648,
+    "tau1.0_verify1_ctx65536": 1625,
+    "tau1.65_verify4_ctx4096": 2615,
+    "tau1.65_verify4_ctx32768": 2583,
+    "tau1.65_verify4_ctx65536": 2548,
+    "tau2.0_verify4_ctx4096": 3170,
+    "tau2.0_verify4_ctx32768": 3131,
+    "tau2.0_verify4_ctx65536": 3089,
+    "tau2.5_verify8_ctx4096": 3993,
+    "tau2.5_verify8_ctx32768": 3945,
+    "tau2.5_verify8_ctx65536": 3891,
+    "tau3.0_verify13_ctx4096": 3718,
+    "tau3.0_verify13_ctx32768": 3682,
+    "tau3.0_verify13_ctx65536": 3643
+  },
+  "elapsed_s": 22.3
+}
