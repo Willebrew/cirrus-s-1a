@@ -18,3 +18,4 @@ data/cache/
 
 # benchmark output on the machine that ran it (curated copies are committed to results/)
 results/local/
+bench*.log
