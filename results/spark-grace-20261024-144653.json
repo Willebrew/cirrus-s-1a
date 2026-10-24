@@ -1,0 +1,183 @@
+{
+  "sections": {
+    "environment": {
+      "host": "grace",
+      "device": "NVIDIA GB10",
+      "capability": "12.1",
+      "torch": "2.13.0+cu130",
+      "gpu_processes": ""
+    },
+    "stream_v5_correctness": {
+      "max_rel_err": 4.1718584498084965e-07
+    },
+    "decode_stream_v5": {
+      "n_stages": 78,
+      "weight_mb": 90.8,
+      "rr0_d1_xl0_M1_us": 534.3,
+      "rr0_d1_xl1_M1_us": 490.3,
+      "rr0_d1_xl0_M2_us": 510.8,
+      "rr0_d1_xl1_M2_us": 485.7,
+      "rr0_d1_xl0_M4_us": 513.5,
+      "rr0_d1_xl1_M4_us": 491.8,
+      "rr0_d1_xl0_M8_us": 533.5,
+      "rr0_d1_xl1_M8_us": 505.3,
+      "rr0_d1_xl0_M13_us": 704.1,
+      "rr0_d1_xl1_M13_us": 650.0,
+      "rr0_d2_xl0_M1_us": 518.1,
+      "rr0_d2_xl1_M1_us": 494.4,
+      "rr0_d2_xl0_M2_us": 511.2,
+      "rr0_d2_xl1_M2_us": 488.4,
+      "rr0_d2_xl0_M4_us": 517.6,
+      "rr0_d2_xl1_M4_us": 495.4,
+      "rr0_d2_xl0_M8_us": 537.0,
+      "rr0_d2_xl1_M8_us": 509.2,
+      "rr0_d2_xl0_M13_us": 691.8,
+      "rr0_d2_xl1_M13_us": 663.7,
+      "rr1_d1_xl0_M1_us": 520.1,
+      "rr1_d1_xl1_M1_us": 493.4,
+      "rr1_d1_xl0_M2_us": 512.9,
+      "rr1_d1_xl1_M2_us": 488.1,
+      "rr1_d1_xl0_M4_us": 517.2,
+      "rr1_d1_xl1_M4_us": 492.2,
+      "rr1_d1_xl0_M8_us": 540.9,
+      "rr1_d1_xl1_M8_us": 511.9,
+      "rr1_d1_xl0_M13_us": 673.5,
+      "rr1_d1_xl1_M13_us": 625.9,
+      "rr1_d2_xl0_M1_us": 520.9,
+      "rr1_d2_xl1_M1_us": 494.8,
+      "rr1_d2_xl0_M2_us": 512.5,
+      "rr1_d2_xl1_M2_us": 489.2,
+      "rr1_d2_xl0_M4_us": 516.5,
+      "rr1_d2_xl1_M4_us": 494.6,
+      "rr1_d2_xl0_M8_us": 540.4,
+      "rr1_d2_xl1_M8_us": 514.3,
+      "rr1_d2_xl0_M13_us": 665.1,
+      "rr1_d2_xl1_M13_us": 635.0,
+      "best": {
+        "M1": {
+          "us": 490.3,
+          "cfg": "wm d1",
+          "gbps": 185.3
+        },
+        "M2": {
+          "us": 485.7,
+          "cfg": "wm d1",
+          "gbps": 187.0
+        },
+        "M4": {
+          "us": 491.8,
+          "cfg": "wm d1",
+          "gbps": 184.7
+        },
+        "M8": {
+          "us": 505.3,
+          "cfg": "wm d1",
+          "gbps": 179.8
+        },
+        "M13": {
+          "us": 625.9,
+          "cfg": "rr d1",
+          "gbps": 145.1
+        }
+      },
+      "profile_M1": {
+        "config": "wm d1",
+        "summary": {
+          "sm_ghz": 2.52,
+          "total_us": 492.3,
+          "xload_us": 41.7,
+          "compute_max_us": 402.9,
+          "compute_med_us": 317.1,
+          "barrier_and_imbalance_us": 49.2
+        },
+        "slowest": [
+          {
+            "stage": "lm_head",
+            "mb": 14.156,
+            "span_us": 58.58,
+            "xload_us": 0.31,
+            "compute_max_us": 57.76
+          },
+          {
+            "stage": "mtp.draft_head",
+            "mb": 3.539,
+            "span_us": 13.03,
+            "xload_us": 0.31,
+            "compute_max_us": 11.51
+          },
+          {
+            "stage": "self0.gdn.qkv+gate+ab",
+            "mb": 1.334,
+            "span_us": 10.52,
+            "xload_us": 3.93,
+            "compute_max_us": 6.02
+          }
+        ],
+        "typical": {
+          "gdn.o (0.33 MB)": {
+            "span_us": 2.85,
+            "xload_us": 0.45,
+            "compute_max_us": 1.85
+          },
+          "ffn.gate_up (1.77 MB)": {
+            "span_us": 8.8,
+            "xload_us": 0.45,
+            "compute_max_us": 7.7
+          },
+          "ffn.down (0.89 MB)": {
+            "span_us": 5.2,
+            "xload_us": 0.66,
+            "compute_max_us": 3.9
+          }
+        }
+      },
+      "profile_M4": {
+        "config": "wm d1",
+        "summary": {
+          "sm_ghz": 2.519,
+          "total_us": 490.7,
+          "xload_us": 61.2,
+          "compute_max_us": 386.7,
+          "compute_med_us": 303.4,
+          "barrier_and_imbalance_us": 49.3
+        },
+        "tail_variance": {
+          "mtp.ffn.down_span_us": [
+            5.03,
+            2.9
+          ],
+          "mtp.draft_head_span_us": [
+            13.03,
+            8.03
+          ],
+          "note": "M=1 vs M=4 single-iteration profiles; totals agree (492.3 vs 490.7 us)"
+        }
+      },
+      "note": "full per-stage lists kept on grace: results/local/spark-grace-20261024-144653.json"
+    },
+    "model_smoke_test": {
+      "params": 155221100,
+      "incremental_rel_err": 6.749391559424112e-06
+    }
+  },
+  "errors": {},
+  "tests": "35 passed",
+  "tok_s_from_measured_stream": {
+    "tau1.0_verify1_ctx4096": 1841,
+    "tau1.0_verify1_ctx32768": 1815,
+    "tau1.0_verify1_ctx65536": 1786,
+    "tau1.65_verify4_ctx4096": 2997,
+    "tau1.65_verify4_ctx32768": 2955,
+    "tau1.65_verify4_ctx65536": 2910,
+    "tau2.0_verify4_ctx4096": 3632,
+    "tau2.0_verify4_ctx32768": 3582,
+    "tau2.0_verify4_ctx65536": 3527,
+    "tau2.5_verify8_ctx4096": 4432,
+    "tau2.5_verify8_ctx32768": 4372,
+    "tau2.5_verify8_ctx65536": 4306,
+    "tau3.0_verify13_ctx4096": 4382,
+    "tau3.0_verify13_ctx32768": 4333,
+    "tau3.0_verify13_ctx65536": 4278
+  },
+  "elapsed_s": 25.2
+}

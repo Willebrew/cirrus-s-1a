@@ -30,10 +30,9 @@ verification. Full walkthrough: [`docs/design/architecture.md`](docs/design/arch
 
 **Measured on a DGX Spark so far** (random weights at the real shapes; see
 [`docs/research/spark-measurements.md`](docs/research/spark-measurements.md)): the full 90.8 MB
-NVFP4 decode-step weight stream runs in **512 µs** in a persistent tensor-core kernel. With
-the remaining KV/state traffic from the roofline, that gives **~3,420 tok/s at τ=2**,
-~2,820 at τ=1.65 and ~4,220 at τ=2.5 (32K context). Kernel work continues to close the gap to the 238 GB/s the
-hardware streams.
+NVFP4 decode-step weight stream runs in **490 µs** (185 GB/s) in a persistent tensor-core
+kernel. With the remaining KV/state traffic from the roofline, that gives **~2,960 tok/s at
+τ=1.65, ~3,580 at τ=2 and ~4,370 at τ=2.5** (32K context). The next deciding number is τ itself.
 
 ## Layout
 
@@ -62,4 +61,4 @@ python scripts/perf_report.py --breakdown
 
 Phase 0 (research + spec) is done. Phase 1 (proving the speed on DGX Spark hardware with random
 weights, before any training) is in progress: hardware characterized, decode weight stream at
-177.5 GB/s and climbing. See [`docs/roadmap.md`](docs/roadmap.md).
+185 GB/s, at the 3,000 tok/s target for τ ≥ 1.68. See [`docs/roadmap.md`](docs/roadmap.md).

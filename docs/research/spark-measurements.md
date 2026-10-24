@@ -184,17 +184,38 @@ move:
 - With depth 2, the first stage's activation load waits 7.4 µs behind the prologue's weight
   loads (2.35 µs at depth 1). That's a one-time cost per step.
 
-## Run 6 (pending): kernel v5, real-rows-only activation loader
+## Run 6 (2026-10-24): kernel v5, at the target
 
-`scripts/bench_spark.py --only decode_stream_v5 model_smoke_test`
+Built cleanly; v5 correctness 4.2e-7 (M=1/3/5/8/13, stale rows present); 35/35 tests.
 
-- `load_x4` loads only the M real token rows, with a division-free thread mapping (2 rows per
-  pass, 256 threads per row). Rows ≥ M are deliberately left stale: in `mma` each output column
-  depends only on its own activation column, so stale rows reach only outputs that are never
-  stored. The correctness check alternates K between stages so stale rows are actually present.
-- Swept against the old loader on the same configurations; the best is profiled per stage.
-- Target: activation load ~0.3-0.4 µs per stage (≈ one L2 round trip + `__syncthreads`), about
-  50 µs off the step, putting τ=1.65 over 3,000 tok/s.
-- Known gap in the estimator: the 2nd MTP draft pass assumes its 6.9 MB of weights hit L2,
-  but the stream loads them evict-first. The real engine should load MTP weights with the L2
-  hint.
+| M | 1 | 2 | 4 | 8 | 13 |
+|---|---|---|---|---|---|
+| v4 best (run 5) | 512 µs | 514 | 519 | 526 | 651 |
+| v5, old loader (best) | 518 | 511 | 514 | 534 | 665 |
+| **v5, real-rows loader (best)** | **490 µs (185.3 GB/s)** | **486 (187.0)** | **492** | **505** | **626** |
+
+The new loader wins at every M (≈5%, 6% at M=13). Best config: warp-major, depth 1, for
+M ≤ 8; round-robin depth 1 at M=13.
+
+**Decode estimate from the measured stream: 2,997 tok/s at τ=1.65 (4K context), 2,955 (32K),
+2,910 (64K); 3,582 at τ=2.0 and 4,372 at τ=2.5 with verify-8 (32K).** 3,000 tok/s at 32K
+context now needs τ ≈ 1.68.
+
+Profile (M=1): 492 µs = **42 µs activation load** (was 99; now 0.31-0.45 µs per stage, about one
+L2 round trip plus `__syncthreads`) + 403 µs compute + 49 µs barrier/imbalance.
+
+Where the remaining headroom is:
+- **Weight bytes at full streaming speed: 381 µs.** The kernel is at 78% of that, overall.
+- **Barriers: ≈49 µs ≈ 78 × 0.61 µs**, the bare `grid.sync()` cost. That can only shrink by
+  having fewer dependent stages (e.g. parallel attention/FFN blocks), not by kernel tuning.
+- **`lm_head`: 58.6 µs (12% of the step)**, streaming at ~245 GB/s, i.e. already at the
+  hardware rate. Only fewer bytes help (smaller vocab, or a lower-bit head).
+- **Tail-stage variance:** in single-iteration profiles, `mtp.ffn.down` / `mtp.draft_head`
+  took 5.0 / 13.0 µs at M=1 but 2.9 / 8.0 µs at M=4, while the step totals agree (492.3 vs
+  490.7 µs). Most likely this varies with how much of the tail weights the prefetch pulled in
+  before those stages started. The 50-iteration timings are the numbers to trust. A future
+  profiler should take the median over several profiled iterations.
+
+**Phase 1a/1b conclusion for the weight stream:** further kernel tuning is worth ≤ ~15%. The
+number that now decides the outcome is τ (accepted tokens per verify step): 2,955 tok/s at
+τ=1.65 versus 4,372 at τ=2.5.
