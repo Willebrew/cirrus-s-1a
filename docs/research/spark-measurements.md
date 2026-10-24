@@ -158,12 +158,43 @@ compute (slowest SM) + 50.5 µs barrier/imbalance.
   compute is 0.07 µs: warp-major task placement put their 288 tasks on the first 18 SMs. An
   offline emulation reproduces exactly this.
 
-## Run 5 (pending): kernel v4, placement × prefetch depth
+## Run 5 (2026-10-24): kernel v4, placement × prefetch depth
 
-`scripts/bench_spark.py --only decode_stream_v4 model_smoke_test`
+Built cleanly; v4 correctness 3.8e-7 across all depths and placements; 35/35 tests.
 
-- `rr=1`: round-robin task placement over blocks, so every stage spreads over all 48 SMs
-  (offline emulation: minimum busy SMs per stage goes from 18 to 48).
-- Prefetch depth D=1/2/3 (register shift ring), so DRAM keeps streaming later stages' weights
-  through the barrier gaps.
-- The full grid is timed, and the best configuration is profiled per stage at M=1 and M=4.
+| M | 1 | 2 | 4 | 8 | 13 |
+|---|---|---|---|---|---|
+| v3 `.cs` (run 4) | 546 µs | 554 | 572 | 567 | 748 |
+| **v4 best** | **512 µs (177.5 GB/s)** | 514 | 519 | 526 | 651 |
+| best config | wm d2 | rr d1 | wm d1 | wm d1 | rr d2 |
+
+All configurations are within ~3% of each other up to M=8. **Decode estimate from the measured
+stream: 2,819 tok/s at τ=1.65, 3,417 at τ=2.0, 4,222 at τ=2.5 (32K context).** τ=1.65 is now
+within ~6% of the target, and 3,000 tok/s is reached at τ ≈ 1.75.
+
+Profile (M=1, wm d2): 528 µs = **99 µs activation load + 393 µs compute + 50 µs barrier/
+imbalance**. The gain over v3 came entirely from the compute phase (425 → 393 µs). FFN
+up-projections now finish 1.77 MB in ~7.1 µs of compute, *faster* than DRAM streaming
+(~249 GB/s), because prefetched weights arrive before the stage starts. The fixed costs didn't
+move:
+- **Activation load: a flat 1.06 µs per stage at K=768 (1.73 µs at K=2048), even at M=1**,
+  where only a single 1.5 KB row is real. The cost tracks the loader's per-thread work (integer
+  divisions over all 512 threads, plus zero-filling 7 unused token rows), not bytes.
+- **Barrier + imbalance: ~0.65 µs per stage**, close to the bare 0.61 µs `grid.sync()`.
+- With depth 2, the first stage's activation load waits 7.4 µs behind the prologue's weight
+  loads (2.35 µs at depth 1). That's a one-time cost per step.
+
+## Run 6 (pending): kernel v5, real-rows-only activation loader
+
+`scripts/bench_spark.py --only decode_stream_v5 model_smoke_test`
+
+- `load_x4` loads only the M real token rows, with a division-free thread mapping (2 rows per
+  pass, 256 threads per row). Rows ≥ M are deliberately left stale: in `mma` each output column
+  depends only on its own activation column, so stale rows reach only outputs that are never
+  stored. The correctness check alternates K between stages so stale rows are actually present.
+- Swept against the old loader on the same configurations; the best is profiled per stage.
+- Target: activation load ~0.3-0.4 µs per stage (≈ one L2 round trip + `__syncthreads`), about
+  50 µs off the step, putting τ=1.65 over 3,000 tok/s.
+- Known gap in the estimator: the 2nd MTP draft pass assumes its 6.9 MB of weights hit L2,
+  but the stream loads them evict-first. The real engine should load MTP weights with the L2
+  hint.

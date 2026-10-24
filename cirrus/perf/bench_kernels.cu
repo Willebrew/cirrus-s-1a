@@ -1044,6 +1044,38 @@ double time_stream3(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_
   return launch_stream3(descs, stages, M, iters, kmax, policy, math, 1.0, none, true);
 }
 
+// v5 activation loader. Run 5 showed the activation load still costs a flat
+// ~1.06 us per stage (1.7 us at K=2048) even at M=1, where only one 1.5 KB row
+// is real: load_x3 runs integer divisions over all 512 threads and writes
+// zero rows. Here only the M real rows are touched, with a division-free
+// mapping (two rows per pass, 256 threads per row). Rows >= M are left stale
+// on purpose: in mma each output column depends only on its own B column, so
+// stale token rows only reach output columns that are never stored.
+template <int NTOK>
+__device__ __forceinline__ void load_x4(__half* xs, const __half* __restrict__ X, int M, int K, int Kp) {
+  constexpr int PASSES = NTOK * 4;  // NTOK*8 rows, 2 per pass
+  const int per_row = K >> 3;       // uint4 per row (<= 256 for K <= 2048)
+  const int rsub = threadIdx.x >> 8, q = threadIdx.x & 255;
+  uint4 v[PASSES];
+#pragma unroll
+  for (int p = 0; p < PASSES; ++p) {
+    const int r = 2 * p + rsub;
+    if (r < M && q < per_row) v[p] = __ldcg(reinterpret_cast<const uint4*>(X + (size_t)r * K) + q);
+  }
+#pragma unroll
+  for (int p = 0; p < PASSES; ++p) {
+    const int r = 2 * p + rsub;
+    if (r < M && q < per_row) {
+      const int k = q * 8;
+      uint32_t* dst = reinterpret_cast<uint32_t*>(xs + r * Kp + (k >> 4) * 16 + ((k >> 3) & 1) * 2);
+      dst[0] = v[p].x;
+      dst[2] = v[p].y;
+      dst[4] = v[p].z;
+      dst[6] = v[p].w;
+    }
+  }
+}
+
 // ======================================================================
 // v4: round-robin placement + D-deep prefetch ring
 // ======================================================================
@@ -1107,7 +1139,7 @@ __device__ __forceinline__ Meta4 cursor4_meta(const Cursor4& cu) {
   return m;
 }
 
-template <int NTOK, int D>
+template <int NTOK, int D, int XL>
 __global__ void __launch_bounds__(V3_THREADS, 1) stream4_kernel(const MatDesc3* __restrict__ gm,
                                                                 const StageDesc3* __restrict__ gs, int n_mats,
                                                                 int n_stages, int M, int iters, float out_scale,
@@ -1148,7 +1180,8 @@ __global__ void __launch_bounds__(V3_THREADS, 1) stream4_kernel(const MatDesc3* 
       const long long t0 = clock64();
       const MatDesc3& first = sm[ss[st].m0];
       const int K = first.K, Kp = K + 16;
-      load_x3<NTOK>(xs, reinterpret_cast<const __half*>(first.X), M, K, Kp);
+      if constexpr (XL == 0) load_x3<NTOK>(xs, reinterpret_cast<const __half*>(first.X), M, K, Kp);
+      else load_x4<NTOK>(xs, reinterpret_cast<const __half*>(first.X), M, K, Kp);
       __syncthreads();
       const long long t1 = clock64();
       while (ok[0] && meta[0].st == st) {
@@ -1194,18 +1227,24 @@ __global__ void __launch_bounds__(V3_THREADS, 1) stream4_kernel(const MatDesc3* 
   }
 }
 
-template <int NTOK, int D>
+template <int NTOK, int D, int XL>
 static void* s4fn() {
-  return (void*)stream4_kernel<NTOK, D>;
+  return (void*)stream4_kernel<NTOK, D, XL>;
 }
 
-static void* pick_stream4(int ntok, int depth) {
-  if (ntok == 1) return depth == 1 ? s4fn<1, 1>() : depth == 2 ? s4fn<1, 2>() : s4fn<1, 3>();
-  return depth == 1 ? s4fn<2, 1>() : s4fn<2, 2>();
+template <int XL>
+static void* pick_stream4_xl(int ntok, int depth) {
+  if (ntok == 1) return depth == 1 ? s4fn<1, 1, XL>() : depth == 2 ? s4fn<1, 2, XL>() : s4fn<1, 3, XL>();
+  return depth == 1 ? s4fn<2, 1, XL>() : s4fn<2, 2, XL>();
+}
+
+static void* pick_stream4(int ntok, int depth, int xl) {
+  return xl ? pick_stream4_xl<1>(ntok, depth) : pick_stream4_xl<0>(ntok, depth);
 }
 
 static double launch_stream4(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax,
-                             int64_t depth, int64_t rr, double out_scale, torch::Tensor prof, bool timed) {
+                             int64_t depth, int64_t rr, double out_scale, torch::Tensor prof, bool timed,
+                             int64_t xl = 0) {
   TORCH_CHECK(descs.is_cuda() && descs.scalar_type() == torch::kInt64 && descs.size(1) == 7);
   TORCH_CHECK(stages.is_cuda() && stages.scalar_type() == torch::kInt32 && stages.size(1) == 4);
   TORCH_CHECK(descs.size(0) <= V3_MAXMATS && stages.size(0) <= V3_MAXSTAGES);
@@ -1217,7 +1256,7 @@ static double launch_stream4(torch::Tensor descs, torch::Tensor stages, int64_t 
   cudaGetDevice(&dev);
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   const int smem = ntok * 8 * ((int)kmax + 16) * (int)sizeof(__half);
-  void* fn = pick_stream4(ntok, (int)depth);
+  void* fn = pick_stream4(ntok, (int)depth, (int)xl);
   const MatDesc3* gm = reinterpret_cast<const MatDesc3*>(descs.data_ptr<int64_t>());
   const StageDesc3* gs = reinterpret_cast<const StageDesc3*>(stages.data_ptr<int>());
   int nm = (int)descs.size(0), ns = (int)stages.size(0), m = (int)M, its = (int)iters, r = (int)rr;
@@ -1245,4 +1284,17 @@ double time_stream4(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_
   auto none = torch::empty({0}, descs.options());
   launch_stream4(descs, stages, M, 1, kmax, depth, rr, 1.0, none, false);  // warm-up
   return launch_stream4(descs, stages, M, iters, kmax, depth, rr, 1.0, none, true);
+}
+
+// v5 = v4 + load_x4 (xl=1), exposed separately so v4 results stay comparable.
+void run_stream5(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t kmax, int64_t depth, int64_t rr,
+                 int64_t xl, double out_scale, torch::Tensor prof) {
+  launch_stream4(descs, stages, M, 1, kmax, depth, rr, out_scale, prof, false, xl);
+}
+
+double time_stream5(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax, int64_t depth,
+                    int64_t rr, int64_t xl) {
+  auto none = torch::empty({0}, descs.options());
+  launch_stream4(descs, stages, M, 1, kmax, depth, rr, 1.0, none, false, xl);  // warm-up
+  return launch_stream4(descs, stages, M, iters, kmax, depth, rr, 1.0, none, true, xl);
 }

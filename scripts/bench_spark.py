@@ -147,6 +147,8 @@ void run_stream3(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t k
 double time_stream3(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax, int64_t policy, int64_t math);
 void run_stream4(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t kmax, int64_t depth, int64_t rr, double out_scale, torch::Tensor prof);
 double time_stream4(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax, int64_t depth, int64_t rr);
+void run_stream5(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t kmax, int64_t depth, int64_t rr, int64_t xl, double out_scale, torch::Tensor prof);
+double time_stream5(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_t iters, int64_t kmax, int64_t depth, int64_t rr, int64_t xl);
 """
     log(f"   building CUDA kernels for sm_{major}{minor} (first run takes ~1 min)...")
     return load_inline(
@@ -155,7 +157,8 @@ double time_stream4(torch::Tensor descs, torch::Tensor stages, int64_t M, int64_
         cuda_sources=src,
         functions=["time_read", "time_coop_barrier", "time_flag_barrier", "nvfp4_gemv", "nvfp4_mma_gemv",
                    "run_stream", "time_stream", "run_stream2", "time_stream2", "time_read_rot", "time_chase",
-                   "run_stream3", "time_stream3", "run_stream4", "time_stream4"],
+                   "run_stream3", "time_stream3", "run_stream4", "time_stream4",
+                   "run_stream5", "time_stream5"],
         extra_cuda_cflags=["-O3", "-lineinfo"],
         verbose=False,
     )
@@ -852,6 +855,81 @@ def decode_stream_v4(ext) -> dict:
     return out
 
 
+# --------------------------------- v5: real-rows-only activation loader
+V5_CONFIGS = [(rr, d) for rr in (0, 1) for d in (1, 2)]  # (placement, depth), all valid for M=13 too
+
+
+@section("stream_v5_correctness")
+def stream_v5_correctness(ext) -> dict:
+    """Stages alternate K (768/2048/768/1536), so stale shared-memory rows
+    from a wider stage are present when M < 8: this checks they are harmless."""
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    stages = [[("a", 768, 768), ("b", 12, 768)], [("c", 768, 2048)], [("d", 4096, 768)], [("e", 64, 1536)]]
+    worst = 0.0
+    empty = torch.empty(0, dtype=torch.int64, device="cuda")
+    for m in (1, 3, 5, 8, 13):
+        st = build_stream3(stages, m, gen, nwarps_total(), keep_ref=True)
+        for rr, depth in V5_CONFIGS + ([(0, 3), (1, 3)] if m <= 8 else []):
+            st["Y"].zero_()
+            ext.run_stream5(st["descs"], st["stages"], m, st["kmax"], depth, rr, 1, 128.0, empty)
+            torch.cuda.synchronize()
+            for y, ref in st["refs"]:
+                worst = max(worst, ((y.view_as(ref) - ref).abs().max() / ref.abs().max()).item())
+    ok = worst < 1e-3
+    log(f"   v5 stream max rel err (M=1/3/5/8/13, all depths/placements): {worst:.2e} -> {'OK' if ok else 'MISMATCH'}")
+    if not ok:
+        raise AssertionError(f"stream5 mismatch: {worst}")
+    return {"max_rel_err": worst}
+
+
+@section("decode_stream_v5")
+def decode_stream_v5(ext) -> dict:
+    from cirrus.perf.shapes import decode_stages
+
+    cfg = get_config("cirrus-s-1a")
+    stages = decode_stages(cfg)
+    gen = torch.Generator(device="cuda").manual_seed(12)
+    out = {"n_stages": len(stages)}
+    iters = 50
+    for m in (1, 2, 4, 8, 13):
+        st = build_stream3(stages, m, gen, nwarps_total())
+        out["weight_mb"] = round(st["bytes"] / 1e6, 1)
+        line, best, best_old = [f"   M={m:2d}:"], None, None
+        for rr, depth in V5_CONFIGS:
+            for xl in (0, 1):
+                ms = min(ext.time_stream5(st["descs"], st["stages"], m, iters, st["kmax"], depth, rr, xl)
+                         for _ in range(3))
+                us = ms * 1e3 / iters
+                key = f"rr{rr}_d{depth}_xl{xl}_M{m}"
+                out[f"{key}_us"] = round(us, 1)
+                if xl:
+                    line.append(f"{'rr' if rr else 'wm'} d{depth} {us:6.1f}")
+                    if best is None or us < best[0]:
+                        best = (us, rr, depth)
+                elif best_old is None or us < best_old:
+                    best_old = us
+        gbps = st["bytes"] / (best[0] * 1e-6) / 1e9
+        out[f"persistent_M{m}_us"] = round(best[0], 1)
+        out[f"best_M{m}"] = {"us": round(best[0], 1), "rr": best[1], "depth": best[2], "gbps": round(gbps, 1),
+                             "best_old_loader_us": round(best_old, 1)}
+        log(" | ".join(line) + f"   -> best {'rr' if best[1] else 'wm'} d{best[2]}: {best[0]:.1f} us "
+            f"({gbps:.1f} GB/s); old loader best {best_old:.1f} us")
+        if m in (1, 4):
+            _, rr, depth = best
+            prof = profile_stream3(ext, st, m, stages, 0, runner=lambda pr: ext.run_stream5(
+                st["descs"], st["stages"], m, st["kmax"], depth, rr, 1, 1.0, pr))
+            out[f"profile_M{m}"] = prof
+            s = prof["summary"]
+            log(f"      profile M={m} ({'rr' if rr else 'wm'} d{depth}): stages {s['total_us']} us = x-load "
+                f"{s['xload_us']} + compute(max) {s['compute_max_us']} [median {s['compute_med_us']}] "
+                f"+ barrier/imbalance {s['barrier_and_imbalance_us']}")
+            for r in prof["slowest"][:5]:
+                log(f"        slow: {r['stage'][:40]:40s} {r['mb']:6.2f} MB span {r['span_us']:6.2f} us "
+                    f"(x {r['xload_us']}, compute max {r['compute_max_us']}, med {r['compute_med_us']}, wait {r['wait_us']})")
+        del st
+    return out
+
+
 @section("prefill_gemm")
 def prefill_gemm() -> dict:
     T = 16384
@@ -1004,6 +1082,8 @@ def main() -> None:
         stream = decode_stream_v3(ext) or stream
     if ext and want("decode_stream_v4") and stream_v4_correctness(ext) is not None:
         stream = decode_stream_v4(ext) or stream
+    if ext and want("decode_stream_v5") and stream_v5_correctness(ext) is not None:
+        stream = decode_stream_v5(ext) or stream
     if ext and want("cache_resident_stream"):
         cache_resident_stream(ext)
     if ext and want("cache_probe"):
