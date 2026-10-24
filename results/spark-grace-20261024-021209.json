@@ -1,0 +1,156 @@
+{
+  "sections": {
+    "environment": {
+      "host": "grace",
+      "device": "NVIDIA GB10",
+      "capability": "12.1",
+      "sms": 48,
+      "torch": "2.13.0+cu130",
+      "torch_cuda": "13.0",
+      "l2_bytes": 25165824,
+      "nvidia_smi": "NVIDIA GB10, 580.178.04, 3003 MHz, [N/A]",
+      "dgx_os": "DGX OS 7.2.3",
+      "gpu_processes": "",
+      "triton": "3.7.1",
+      "fla": null
+    },
+    "l2_sweep": {
+      "points": [
+        {
+          "mb": 1,
+          "gbps": 1900.6,
+          "gbps_constant_data": 1901.6
+        },
+        {
+          "mb": 2,
+          "gbps": 2116.2,
+          "gbps_constant_data": 2093.1
+        },
+        {
+          "mb": 4,
+          "gbps": 2089.0,
+          "gbps_constant_data": 2066.2
+        },
+        {
+          "mb": 8,
+          "gbps": 2114.4,
+          "gbps_constant_data": 2099.4
+        },
+        {
+          "mb": 12,
+          "gbps": 2064.3,
+          "gbps_constant_data": 2030.3
+        },
+        {
+          "mb": 16,
+          "gbps": 2038.0,
+          "gbps_constant_data": 2044.1
+        },
+        {
+          "mb": 20,
+          "gbps": 2101.8,
+          "gbps_constant_data": 2078.8
+        },
+        {
+          "mb": 24,
+          "gbps": 2049.3,
+          "gbps_constant_data": 2049.2
+        },
+        {
+          "mb": 28,
+          "gbps": 2010.6,
+          "gbps_constant_data": 2036.2
+        },
+        {
+          "mb": 32,
+          "gbps": 2028.2,
+          "gbps_constant_data": 2000.3
+        },
+        {
+          "mb": 40,
+          "gbps": 2019.5,
+          "gbps_constant_data": 2003.0
+        },
+        {
+          "mb": 48,
+          "gbps": 2001.9,
+          "gbps_constant_data": 2000.1
+        },
+        {
+          "mb": 64,
+          "gbps": 1972.1,
+          "gbps_constant_data": 1999.4
+        },
+        {
+          "mb": 96,
+          "gbps": 971.7,
+          "gbps_constant_data": 1259.2
+        },
+        {
+          "mb": 128,
+          "gbps": 291.5,
+          "gbps_constant_data": 332.6
+        },
+        {
+          "mb": 256,
+          "gbps": 234.5,
+          "gbps_constant_data": 245.0
+        }
+      ],
+      "l2_plateau_gbps": 2033.1,
+      "largest_l2_resident_mb": 96
+    },
+    "nvfp4_mma_correctness": {
+      "gemv_max_rel_err": 2.5690749794193835e-07,
+      "stream_max_rel_err": 2.992347845065524e-07
+    },
+    "decode_stream_v1": {
+      "n_stages": 78,
+      "weight_mb": 90.8,
+      "persistent_M1_us": 637.6,
+      "persistent_M1_gbps": 142.5,
+      "graph_M1_us": 732.0,
+      "graph_M1_gbps": 124.1,
+      "persistent_M2_us": 656.3,
+      "persistent_M2_gbps": 138.4,
+      "graph_M2_us": 759.6,
+      "graph_M2_gbps": 119.6,
+      "persistent_M4_us": 687.0,
+      "persistent_M4_gbps": 132.2,
+      "graph_M4_us": 818.5,
+      "graph_M4_gbps": 111.0,
+      "persistent_M8_us": 773.1,
+      "persistent_M8_gbps": 117.5,
+      "graph_M8_us": 925.2,
+      "graph_M8_gbps": 98.2,
+      "persistent_M13_us": 1042.2,
+      "persistent_M13_gbps": 87.2,
+      "graph_M13_us": 1445.7,
+      "graph_M13_gbps": 62.8
+    },
+    "model_smoke_test": {
+      "params": 155221100,
+      "incremental_rel_err": 6.749391559424112e-06
+    }
+  },
+  "errors": {},
+  "tests": "35 passed",
+  "tok_s_from_measured_stream": {
+    "tau1.0_verify1_ctx4096": 1448,
+    "tau1.0_verify1_ctx32768": 1432,
+    "tau1.0_verify1_ctx65536": 1414,
+    "tau1.65_verify4_ctx4096": 2212,
+    "tau1.65_verify4_ctx32768": 2190,
+    "tau1.65_verify4_ctx65536": 2164,
+    "tau2.0_verify4_ctx4096": 2682,
+    "tau2.0_verify4_ctx32768": 2654,
+    "tau2.0_verify4_ctx65536": 2624,
+    "tau2.5_verify8_ctx4096": 3005,
+    "tau2.5_verify8_ctx32768": 2978,
+    "tau2.5_verify8_ctx65536": 2947,
+    "tau3.0_verify13_ctx4096": 2725,
+    "tau3.0_verify13_ctx32768": 2706,
+    "tau3.0_verify13_ctx65536": 2685
+  },
+  "elapsed_s": 20.1
+}

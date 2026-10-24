@@ -55,16 +55,57 @@ Diagnosis:
   (`cirrus/model/layers.py::topk_mask`), and a regression test was added.
 - `flash-linear-attention` is not installed; the GDN reference path was used.
 
-## Run 2 (pending): kernel v1
+## Run 2 (2026-10-24): kernel v1
 
-`scripts/bench_spark.py --only l2_sweep decode_stream_v1 model_smoke_test`, then `pytest -q`
+All kernels built, all correctness checks passed (mma GEMV 2.6e-7, persistent stream 3.0e-7),
+and **all 35 tests passed**, including the sparse incremental-decode test fixed after run 1.
 
-- **Tensor-core NVFP4 GEMV:** weights pre-shuffled into a fragment-major tile layout (one
-  16-byte load per lane per 16×64 tile), exact FP4→FP16 bit-trick dequant, `mma.m16n8k16` with
-  FP32 accumulation, split-K over 128-wide chunks. Checked against a dense reference. The
-  layout↔fragment mapping was also verified offline in a numpy emulation of the kernel.
-- **Persistent stream kernel:** the megakernel's skeleton. One cooperative launch streams all
-  78 fused stages of a decode step (matrices sharing an input form one stage) with `grid.sync()`
-  between stages.
-- **New estimate:** decode tok/s computed from the *measured* persistent stream, with only the
-  small KV/state traffic from the roofline.
+### Decode weight stream (90.8 MB, tensor-core NVFP4)
+
+| M (tokens verified) | 1 | 2 | 4 | 8 | 13 |
+|---|---|---|---|---|---|
+| v0 per-matrix, CUDA cores (run 1) | 963 µs | 1,687 | 3,134 | 5,948 | 9,512 |
+| v1 per-matrix, CUDA graph | 732 µs | 760 | 819 | 925 | 1,446 |
+| **v1 persistent, 78 stages** | **638 µs (142 GB/s)** | 656 | 687 | 773 | 1,042 |
+
+Tensor cores fixed the scaling with M: going from 1 to 8 tokens now costs +21%, not +518%. But
+the persistent stream reaches only 52% of the DRAM peak (60% of the 238 GB/s streaming read),
+which gives **~2,190 tok/s at τ=1.65 (verify 4)** and ~2,980 at τ=2.5 (verify 8).
+
+Diagnosis:
+- **≈3 µs of fixed cost per stage.** (638 − 381 µs ideal) / 78 stages ≈ 3.3 µs. Every stage
+  waits for DRAM latency, the grid barrier and the activation load before its first weight
+  bytes arrive. Weights don't depend on activations, so they can be in flight across the barrier.
+- **Global split-K atomics cost ≈15 µs per million.** From the slopes: M 1→4 adds 50 µs,
+  M 4→8 adds 86 µs. The atomic count scales with M (≈1.2M at M=1, ≈9.6M at M=8).
+
+### The cache surprise is real (not compression)
+
+| working set | 24 MB | 32 | 48 | 64 | 96 | 128 | 256 |
+|---|---|---|---|---|---|---|---|
+| random data, GB/s | 2,049 | 2,028 | 2,002 | 1,972 | 972 | 292 | 235 |
+| constant data, GB/s | 2,049 | 2,000 | 2,000 | 1,999 | 1,259 | 333 | 245 |
+
+Random and constant data behave the same, so this isn't compression. Something serves
+**≈64 MB at ≈2 TB/s** and part of 96 MB. Public material lists a 24 MB GPU L2 plus a 16 MB
+system-level cache (40 MB total) ([Hot Chips 2025](https://www.hc2025.hotchips.org/assets/program/conference/day2/21_nvidia_skende_final.pdf),
+[Chips and Cheese](https://chipsandcheese.com/p/analyzing-nvidia-gb10s-gpu)), and the GPU's use of
+the SLC isn't documented. That still doesn't explain a full-speed plateau at 64 MB, so run 3
+adds a rotating-offset sweep and a pointer-chase latency curve to rule out any per-thread reuse
+artifact.
+
+**Why it matters:** the NVFP4 decode working set is ~91 MB, just past the edge. If ≈64 MB can
+stay resident across decode steps, a model whose per-step weights fit (≈110M params at NVFP4,
+or 155M at ~3 bits) could stream at several times DRAM speed.
+
+## Run 3 (pending): kernel v2 + cache probes
+
+`scripts/bench_spark.py --only decode_stream_v2 cache_resident_stream cache_probe model_smoke_test`
+
+- **v2 pipelined persistent stream:** each warp always has its next chunk of weight loads in
+  flight, across task *and* stage boundaries, so DRAM never idles at a barrier. Split-K is sized
+  per stage (46,767 tasks for the full step versus ~89K chunks before), which also cuts atomics.
+  The traversal was verified offline (every chunk computed once, every task flushed once).
+- **Cache-policy variants:** evict-first (`.cs`), L2 (`.cg`) and read-only (`.nc`) loads.
+- **Cache-resident test:** streams the first 16/32/48/64/80 MB of the model back to back.
+- **Cache probes:** rotating-offset read sweep, and dependent-load latency vs. working set.

@@ -139,6 +139,10 @@ torch::Tensor nvfp4_gemv(torch::Tensor W, torch::Tensor S, torch::Tensor X, doub
 torch::Tensor nvfp4_mma_gemv(torch::Tensor W, torch::Tensor S, torch::Tensor X, int64_t N, double gscale, torch::Tensor Y);
 void run_stream(torch::Tensor descs, torch::Tensor stage_first, int64_t n_stages, int64_t M, int64_t kmax);
 double time_stream(torch::Tensor descs, torch::Tensor stage_first, int64_t n_stages, int64_t M, int64_t iters, int64_t kmax);
+void run_stream2(torch::Tensor descs, torch::Tensor stage_first, torch::Tensor tasks, torch::Tensor stf, int64_t n_stages, int64_t M, int64_t kmax, int64_t policy);
+double time_stream2(torch::Tensor descs, torch::Tensor stage_first, torch::Tensor tasks, torch::Tensor stf, int64_t n_stages, int64_t M, int64_t iters, int64_t kmax, int64_t policy);
+double time_read_rot(torch::Tensor buf, int64_t iters, int64_t blocks, int64_t threads);
+double time_chase(torch::Tensor next, int64_t start, int64_t hops);
 """
     log(f"   building CUDA kernels for sm_{major}{minor} (first run takes ~1 min)...")
     return load_inline(
@@ -146,7 +150,7 @@ double time_stream(torch::Tensor descs, torch::Tensor stage_first, int64_t n_sta
         cpp_sources=decls,
         cuda_sources=src,
         functions=["time_read", "time_coop_barrier", "time_flag_barrier", "nvfp4_gemv", "nvfp4_mma_gemv",
-                   "run_stream", "time_stream"],
+                   "run_stream", "time_stream", "run_stream2", "time_stream2", "time_read_rot", "time_chase"],
         extra_cuda_cflags=["-O3", "-lineinfo"],
         verbose=False,
     )
@@ -490,6 +494,139 @@ def decode_stream_v1(ext) -> dict:
     return out
 
 
+# ------------------------------------------- v2: pipelined persistent stream
+POLICIES = {0: "evict_first(.cs)", 1: "l2(.cg)", 2: "readonly(.nc)"}
+
+
+def make_tasks(stages, nwarps: int):
+    """Split-K sized per stage so the stage has ~nwarps tasks (tile-major,
+    so one tile's K-splits land on neighbouring warps)."""
+    rows, firsts, mi = [], [0], 0
+    for st in stages:
+        total_chunks = sum(((n + 15) // 16) * (k // 128) for _, n, k in st)
+        nkc = max(1, -(-total_chunks // nwarps))
+        for _, n, k in st:
+            kchunks = k // 128
+            step = min(nkc, kchunks)
+            for nt in range((n + 15) // 16):
+                for kc0 in range(0, kchunks, step):
+                    rows.append([mi, nt, kc0, min(step, kchunks - kc0)])
+            mi += 1
+        firsts.append(len(rows))
+    return (torch.tensor(rows, dtype=torch.int32, device="cuda"),
+            torch.tensor(firsts, dtype=torch.int32, device="cuda"))
+
+
+def nwarps_total() -> int:
+    return torch.cuda.get_device_properties(0).multi_processor_count * 16  # 512-thread blocks
+
+
+@section("stream_v2_correctness")
+def stream_v2_correctness(ext) -> dict:
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    stages = [[("a", 768, 768), ("b", 12, 768)], [("c", 768, 2048)], [("d", 4096, 768)], [("e", 64, 1536)]]
+    worst = 0.0
+    for m in (1, 5, 13):
+        for policy in POLICIES:
+            st = build_stream(ext, stages, m, gen, keep_ref=True)
+            tasks, stf = make_tasks(stages, nwarps_total())
+            ext.run_stream2(st["descs"], st["stage_first"], tasks, stf, st["n_stages"], m, st["kmax"], policy)
+            torch.cuda.synchronize()
+            for y, ref in st["refs"]:
+                worst = max(worst, ((y.view_as(ref) - ref).abs().max() / ref.abs().max()).item())
+    ok = worst < 1e-3
+    log(f"   pipelined stream max rel err (3 policies, M=1/5/13): {worst:.2e} -> {'OK' if ok else 'MISMATCH'}")
+    if not ok:
+        raise AssertionError(f"stream2 mismatch: {worst}")
+    return {"max_rel_err": worst}
+
+
+@section("decode_stream_v2")
+def decode_stream_v2(ext) -> dict:
+    from cirrus.perf.shapes import decode_stages
+
+    cfg = get_config("cirrus-s-1a")
+    stages = decode_stages(cfg)
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    tasks, stf = make_tasks(stages, nwarps_total())
+    out = {"n_stages": len(stages), "n_tasks": int(tasks.shape[0])}
+    iters = 50
+    for m in (1, 2, 4, 8, 13):
+        st = build_stream(ext, stages, m, gen)
+        line = [f"   M={m:2d}:"]
+        for policy, pname in POLICIES.items():
+            ms = min(ext.time_stream2(st["descs"], st["stage_first"], tasks, stf, st["n_stages"], m, iters,
+                                      st["kmax"], policy) for _ in range(3))
+            us = ms * 1e3 / iters
+            out[f"p{policy}_M{m}_us"] = round(us, 1)
+            out[f"p{policy}_M{m}_gbps"] = round(st["bytes"] / (us * 1e-6) / 1e9, 1)
+            line.append(f"{pname} {us:6.1f} us ({out[f'p{policy}_M{m}_gbps']:6.1f} GB/s)")
+        log(" | ".join(line))
+        out["weight_mb"] = round(st["bytes"] / 1e6, 1)
+        del st
+    for m in (1, 2, 4, 8, 13):  # best policy per M, in the v1 key format for the estimator
+        best = min(out[f"p{p}_M{m}_us"] for p in POLICIES)
+        out[f"persistent_M{m}_us"] = best
+    return out
+
+
+@section("cache_resident_stream")
+def cache_resident_stream(ext) -> dict:
+    """If GB10 really caches > 24 MB (L2 sweep, run 2), a decode step whose
+    weights fit could run far above DRAM speed. Stream the first stages of
+    the model up to a byte budget, back to back, and compare cache hints."""
+    from cirrus.perf.shapes import decode_stages
+
+    stages_all = decode_stages(get_config("cirrus-s-1a"))
+    gen = torch.Generator(device="cuda").manual_seed(6)
+    out = {}
+    for budget_mb in (16, 32, 48, 64, 80):
+        stages, total = [], 0
+        for s in stages_all:
+            b = sum(((n + 15) // 16 * 16) * k * 9 // 16 for _, n, k in s)  # 4.5 bits/weight
+            if total + b > budget_mb * 1e6:
+                break
+            stages.append(s)
+            total += b
+        st = build_stream(ext, stages, 1, gen)
+        tasks, stf = make_tasks(stages, nwarps_total())
+        line = [f"   {budget_mb:3d} MB budget ({st['bytes'] / 1e6:5.1f} MB, {len(stages)} stages):"]
+        for policy, pname in POLICIES.items():
+            ms = min(ext.time_stream2(st["descs"], st["stage_first"], tasks, stf, st["n_stages"], 1, 50,
+                                      st["kmax"], policy) for _ in range(3))
+            gbps = st["bytes"] * 50 / (ms * 1e-3) / 1e9
+            out[f"{budget_mb}MB_p{policy}_gbps"] = round(gbps, 1)
+            line.append(f"{pname} {gbps:7.1f} GB/s")
+        log(" | ".join(line))
+        del st
+    return out
+
+
+@section("cache_probe")
+def cache_probe(ext, sms: int) -> dict:
+    out = {"rotated_read": [], "chase": []}
+    for size_mb in (16, 24, 32, 40, 48, 64, 80, 96, 128, 256):
+        buf = torch.empty(size_mb * MB, dtype=torch.uint8, device="cuda").random_(0, 256)
+        iters = max(2, 4096 // size_mb)
+        ms = min(ext.time_read_rot(buf, iters, sms * 8, 512) for _ in range(3))
+        gbps = size_mb * MB * iters / (ms * 1e-3) / 1e9
+        out["rotated_read"].append({"mb": size_mb, "gbps": round(gbps, 1)})
+        del buf
+    log("   rotated-offset read: " + ", ".join(f"{r['mb']}MB {r['gbps']:.0f}" for r in out["rotated_read"]))
+    hops = 100_000
+    for size_mb in (0.25, 1, 4, 16, 24, 32, 40, 48, 64, 96, 128, 256):
+        lines = int(size_mb * MB) // 128
+        perm = torch.randperm(lines, device="cuda", dtype=torch.int64)
+        nxt = torch.zeros(lines * 32, dtype=torch.int32, device="cuda")
+        nxt[perm * 32] = (torch.roll(perm, -1) * 32).to(torch.int32)
+        ms = min(ext.time_chase(nxt, int(perm[0]) * 32, hops) for _ in range(2))
+        ns = ms * 1e6 / hops
+        out["chase"].append({"mb": size_mb, "ns": round(ns, 1)})
+        del nxt, perm
+    log("   dependent-load latency (ns): " + ", ".join(f"{r['mb']}MB {r['ns']:.0f}" for r in out["chase"]))
+    return out
+
+
 @section("prefill_gemm")
 def prefill_gemm() -> dict:
     T = 16384
@@ -610,7 +747,7 @@ def main() -> None:
     ap.add_argument("--skip-model", action="store_true", help="skip the reference-model smoke test")
     ap.add_argument("--only", nargs="*", default=None,
                     help="run only these sections (plus environment), e.g. --only l2_sweep decode_stream_v1")
-    ap.add_argument("--out", default=str(ROOT / "results"))
+    ap.add_argument("--out", default=str(ROOT / "results" / "local"))  # gitignored
     args = ap.parse_args()
     if not torch.cuda.is_available():
         sys.exit("CUDA is not available to this torch build")
@@ -636,6 +773,12 @@ def main() -> None:
     stream = None
     if ext and want("decode_stream_v1") and nvfp4_mma_correctness(ext) is not None:
         stream = decode_stream_v1(ext)
+    if ext and want("decode_stream_v2") and stream_v2_correctness(ext) is not None:
+        stream = decode_stream_v2(ext) or stream
+    if ext and want("cache_resident_stream"):
+        cache_resident_stream(ext)
+    if ext and want("cache_probe"):
+        cache_probe(ext, sms)
     if want("prefill_gemm"):
         prefill_gemm()
     if not args.skip_model and want("model_smoke_test"):

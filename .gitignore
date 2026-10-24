@@ -15,3 +15,6 @@ data/cache/
 *.safetensors
 *.bin
 *.engine
+
+# benchmark output on the machine that ran it (curated copies are committed to results/)
+results/local/

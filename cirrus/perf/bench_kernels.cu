@@ -460,3 +460,265 @@ double time_stream(torch::Tensor descs, torch::Tensor stage_first, int64_t n_sta
   launch_stream(descs, stage_first, n_stages, M, 1, kmax, false);  // warm-up
   return launch_stream(descs, stage_first, n_stages, M, iters, kmax, true);
 }
+
+// ======================================================================
+// v2: software-pipelined persistent stream
+// ======================================================================
+// Run 2 showed v1 loses ~3 us per stage: every stage waits for DRAM latency,
+// the barrier and the activation load before its first weight bytes arrive.
+// Weights do not depend on activations, so v2 keeps exactly one chunk of
+// loads in flight per warp at all times, across task AND stage boundaries:
+// while chunk i is being multiplied, chunk i+1 (possibly in a later stage)
+// is already on its way. Split-K is sized per stage on the host so tasks
+// roughly match the warp count, and POLICY selects the load cache hint:
+//   0 = ld.global.cs (evict-first), 1 = ld.global.cg (L2), 2 = ld.global.nc
+
+struct TaskDesc {
+  int mat, nt, kc0, nkc;  // kc in 128-wide chunks
+};
+
+struct Chunk {
+  uint4 w[KCH];
+  uint32_t sg[KCH], sg8[KCH];
+};
+
+template <int POLICY>
+__device__ __forceinline__ uint4 ld_w(const uint4* p) {
+  if constexpr (POLICY == 0) return __ldcs(p);
+  else if constexpr (POLICY == 1) return __ldcg(p);
+  else return __ldg(p);
+}
+
+template <int POLICY>
+__device__ __forceinline__ uint32_t ld_u(const unsigned int* p) {
+  if constexpr (POLICY == 0) return __ldcs(p);
+  else if constexpr (POLICY == 1) return __ldcg(p);
+  else return __ldg(p);
+}
+
+template <int POLICY>
+__device__ __forceinline__ void load_chunk(Chunk& ch, const MatDesc& d, int nt, int kc, int lane) {
+  const int KT = d.K / 64, g = lane >> 2;
+  const uint8_t* W = reinterpret_cast<const uint8_t*>(d.W);
+  const uint8_t* S = reinterpret_cast<const uint8_t*>(d.S);
+#pragma unroll
+  for (int i = 0; i < KCH; ++i) {
+    const size_t tile = (size_t)nt * KT + kc * KCH + i;
+    ch.w[i] = ld_w<POLICY>(reinterpret_cast<const uint4*>(W + tile * 512) + lane);
+    const unsigned int* sp = reinterpret_cast<const unsigned int*>(S + tile * 64);
+    ch.sg[i] = ld_u<POLICY>(sp + g);
+    ch.sg8[i] = ld_u<POLICY>(sp + g + 8);
+  }
+}
+
+template <int NTOK>
+__device__ __forceinline__ void compute_chunk(const Chunk& ch, float (&acc)[NTOK][4], const __half* Xs, int Kp,
+                                              int kc, int lane) {
+  const int g = lane >> 2, c = lane & 3;
+#pragma unroll
+  for (int i = 0; i < KCH; ++i) {
+    const uint32_t words[4] = {ch.w[i].x, ch.w[i].y, ch.w[i].z, ch.w[i].w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const __half2 s0 = e4m3_to_half2(ch.sg[i] >> (8 * j));
+      const __half2 s1 = e4m3_to_half2(ch.sg8[i] >> (8 * j));
+      const uint32_t u = words[j];
+      uint32_t a[4];
+      a[0] = dq_pair(u & 0xFFu, s0);
+      a[1] = dq_pair((u >> 8) & 0xFFu, s1);
+      a[2] = dq_pair((u >> 16) & 0xFFu, s0);
+      a[3] = dq_pair(u >> 24, s1);
+      const int k0 = (kc * KCH + i) * 64 + j * 16 + 2 * c;
+#pragma unroll
+      for (int t = 0; t < NTOK; ++t) {
+        const __half* xr = Xs + (t * 8 + g) * Kp + k0;
+        mma_16816(acc[t], a, *reinterpret_cast<const uint32_t*>(xr), *reinterpret_cast<const uint32_t*>(xr + 8));
+      }
+    }
+  }
+}
+
+template <int NTOK>
+__device__ __forceinline__ void flush_acc(float (&acc)[NTOK][4], const MatDesc& d, int nt, int M, int lane) {
+  const int g = lane >> 2, c = lane & 3;
+  float* Y = reinterpret_cast<float*>(d.Y);
+  const int N = d.N, r0 = nt * 16 + g, r1 = r0 + 8;
+#pragma unroll
+  for (int t = 0; t < NTOK; ++t) {
+    const int t0 = t * 8 + 2 * c, t1 = t0 + 1;
+    if (r0 < N) {
+      if (t0 < M) atomicAdd(Y + (size_t)t0 * N + r0, acc[t][0]);
+      if (t1 < M) atomicAdd(Y + (size_t)t1 * N + r0, acc[t][1]);
+    }
+    if (r1 < N) {
+      if (t0 < M) atomicAdd(Y + (size_t)t0 * N + r1, acc[t][2]);
+      if (t1 < M) atomicAdd(Y + (size_t)t1 * N + r1, acc[t][3]);
+    }
+  }
+}
+
+// Advance (s, j) to the first stage >= s in which this warp owns task j.
+__device__ __forceinline__ bool seek(int& s, int& j, const int* __restrict__ stf, int n_stages, int warp, int nwarps) {
+  while (s < n_stages && stf[s] + warp + j * nwarps >= stf[s + 1]) {
+    ++s;
+    j = 0;
+  }
+  return s < n_stages;
+}
+
+template <int NTOK, int POLICY>
+__global__ void __launch_bounds__(512, 1) stream2_kernel(const MatDesc* __restrict__ mats,
+                                                         const int* __restrict__ stage_first,
+                                                         const TaskDesc* __restrict__ tasks,
+                                                         const int* __restrict__ stf, int n_stages, int M,
+                                                         int iters) {
+  extern __shared__ __align__(16) __half xs[];
+  cg::grid_group grid = cg::this_grid();
+  const int lane = threadIdx.x & 31;
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int nwarps = (gridDim.x * blockDim.x) >> 5;
+  for (int it = 0; it < iters; ++it) {
+    int s = 0, j = 0, c = 0;
+    bool valid = seek(s, j, stf, n_stages, warp, nwarps);
+    Chunk cur, nxt;
+    if (valid) {
+      const TaskDesc t0 = tasks[stf[s] + warp];
+      load_chunk<POLICY>(cur, mats[t0.mat], t0.nt, t0.kc0, lane);
+    }
+    float acc[NTOK][4];
+    for (int st = 0; st < n_stages; ++st) {
+      const int K = mats[stage_first[st]].K, Kp = K + 8;
+      load_x<NTOK>(xs, reinterpret_cast<const __half*>(mats[stage_first[st]].X), M, K, Kp);
+      __syncthreads();
+      while (valid && s == st) {
+        const TaskDesc td = tasks[stf[s] + warp + j * nwarps];
+        if (c == 0) {
+#pragma unroll
+          for (int t = 0; t < NTOK; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+        }
+        // position of this warp's next chunk, then put its loads in flight
+        int s2 = s, j2 = j, c2 = c + 1;
+        if (c2 >= td.nkc) {
+          c2 = 0;
+          ++j2;
+        }
+        const bool valid2 = seek(s2, j2, stf, n_stages, warp, nwarps);
+        if (valid2) {
+          const TaskDesc tn = tasks[stf[s2] + warp + j2 * nwarps];
+          load_chunk<POLICY>(nxt, mats[tn.mat], tn.nt, tn.kc0 + c2, lane);
+        }
+        compute_chunk<NTOK>(cur, acc, xs, Kp, td.kc0 + c, lane);
+        if (c + 1 >= td.nkc) flush_acc<NTOK>(acc, mats[td.mat], td.nt, M, lane);
+        cur = nxt;
+        s = s2;
+        j = j2;
+        c = c2;
+        valid = valid2;
+      }
+      grid.sync();
+    }
+  }
+}
+
+template <int NTOK, int POLICY>
+static void* stream2_fn() {
+  return (void*)stream2_kernel<NTOK, POLICY>;
+}
+
+static double launch_stream2(torch::Tensor descs, torch::Tensor stage_first, torch::Tensor tasks, torch::Tensor stf,
+                             int64_t n_stages, int64_t M, int64_t iters, int64_t kmax, int64_t policy, bool timed) {
+  TORCH_CHECK(descs.is_cuda() && descs.scalar_type() == torch::kInt64 && descs.size(1) == 6);
+  TORCH_CHECK(tasks.is_cuda() && tasks.scalar_type() == torch::kInt32 && tasks.size(1) == 4);
+  TORCH_CHECK(stage_first.scalar_type() == torch::kInt32 && stf.scalar_type() == torch::kInt32);
+  TORCH_CHECK(M >= 1 && M <= 16 && policy >= 0 && policy <= 2);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int dev = 0, sms = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  const int ntok = M <= 8 ? 1 : 2;
+  const int smem = ntok * 8 * ((int)kmax + 8) * (int)sizeof(__half);
+  void* fn = nullptr;
+  if (ntok == 1) fn = policy == 0 ? stream2_fn<1, 0>() : policy == 1 ? stream2_fn<1, 1>() : stream2_fn<1, 2>();
+  else fn = policy == 0 ? stream2_fn<2, 0>() : policy == 1 ? stream2_fn<2, 1>() : stream2_fn<2, 2>();
+  const MatDesc* mats = reinterpret_cast<const MatDesc*>(descs.data_ptr<int64_t>());
+  const int* sf = stage_first.data_ptr<int>();
+  const TaskDesc* tk = reinterpret_cast<const TaskDesc*>(tasks.data_ptr<int>());
+  const int* tf = stf.data_ptr<int>();
+  int ns = (int)n_stages, m = (int)M, its = (int)iters;
+  void* args[] = {&mats, &sf, &tk, &tf, &ns, &m, &its};
+  CUDA_OK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  if (!timed) {
+    CUDA_OK(cudaLaunchCooperativeKernel(fn, dim3(sms), dim3(512), args, smem, stream));
+    return 0.0;
+  }
+  EventTimer t(stream);
+  t.start();
+  CUDA_OK(cudaLaunchCooperativeKernel(fn, dim3(sms), dim3(512), args, smem, stream));
+  return t.stop_ms();
+}
+
+void run_stream2(torch::Tensor descs, torch::Tensor stage_first, torch::Tensor tasks, torch::Tensor stf,
+                 int64_t n_stages, int64_t M, int64_t kmax, int64_t policy) {
+  launch_stream2(descs, stage_first, tasks, stf, n_stages, M, 1, kmax, policy, false);
+}
+
+double time_stream2(torch::Tensor descs, torch::Tensor stage_first, torch::Tensor tasks, torch::Tensor stf,
+                    int64_t n_stages, int64_t M, int64_t iters, int64_t kmax, int64_t policy) {
+  launch_stream2(descs, stage_first, tasks, stf, n_stages, M, 1, kmax, policy, false);  // warm-up
+  return launch_stream2(descs, stage_first, tasks, stf, n_stages, M, iters, kmax, policy, true);
+}
+
+// ------------------------------------------- cache hierarchy probes
+// Same streaming read as read_kernel, but each pass starts at a different
+// offset so no thread ever re-reads its own addresses: rules out any
+// per-thread reuse artifact in the L2 sweep.
+__global__ void read_rot_kernel(const int4* __restrict__ p, long long n, int iters, unsigned* sink) {
+  unsigned acc = 0;
+  const long long stride = (long long)gridDim.x * blockDim.x;
+  for (int it = 0; it < iters; ++it) {
+    const long long off = ((long long)it * (n / 7 + 4099)) % n;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+      long long idx = i + off;
+      if (idx >= n) idx -= n;
+      int4 v = __ldcg(p + idx);
+      acc ^= (unsigned)(v.x ^ v.y ^ v.z ^ v.w) + (unsigned)it;
+    }
+  }
+  if (acc == 0x9e3779b9u) sink[0] = acc;
+}
+
+double time_read_rot(torch::Tensor buf, int64_t iters, int64_t blocks, int64_t threads) {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  long long n = (long long)(buf.numel() * buf.element_size() / sizeof(int4));
+  auto sink = torch::zeros({1}, buf.options().dtype(torch::kInt32));
+  auto* p = reinterpret_cast<const int4*>(buf.data_ptr());
+  auto* s = reinterpret_cast<unsigned*>(sink.data_ptr());
+  read_rot_kernel<<<blocks, threads, 0, stream>>>(p, n, 1, s);
+  EventTimer t(stream);
+  t.start();
+  read_rot_kernel<<<blocks, threads, 0, stream>>>(p, n, (int)iters, s);
+  double ms = t.stop_ms();
+  CUDA_OK(cudaGetLastError());
+  return ms;
+}
+
+// Dependent-load latency: one thread walks a random cycle of 128-byte lines.
+__global__ void chase_kernel(const unsigned* __restrict__ next, unsigned start, int hops, unsigned* sink) {
+  unsigned p = start;
+  for (int h = 0; h < hops; ++h) p = __ldcg(next + p);
+  sink[0] = p;
+}
+
+double time_chase(torch::Tensor next, int64_t start, int64_t hops) {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto sink = torch::zeros({1}, next.options());
+  const unsigned* nx = reinterpret_cast<const unsigned*>(next.data_ptr<int>());
+  unsigned* s = reinterpret_cast<unsigned*>(sink.data_ptr<int>());
+  chase_kernel<<<1, 1, 0, stream>>>(nx, (unsigned)start, (int)std::min<int64_t>(hops, 4096), s);  // warm
+  EventTimer t(stream);
+  t.start();
+  chase_kernel<<<1, 1, 0, stream>>>(nx, (unsigned)start, (int)hops, s);
+  double ms = t.stop_ms();
+  CUDA_OK(cudaGetLastError());
+  return ms;
+}
