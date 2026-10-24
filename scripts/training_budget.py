@@ -94,11 +94,33 @@ def dollars(s: Scenario, spark_offload: bool) -> dict[str, float]:
     }
 
 
+# Lean own-hardware recipe (docs/plans/training-budget.md): dense, reading-focused data.
+OWN_PLAN = [("ablations (6 x 3B)", 18e9, 1.0), ("pretrain", 200e9, 1.0), ("mid-train (8K-64K ctx)", 25e9, 0.6),
+            ("SFT (3 epochs)", 1.5e9, 1.0)]
+
+
+def own_timeline(rates: list[float]) -> None:
+    print("| phase | tokens | " + " | ".join(f"{r / 1e3:.0f}K tok/s" for r in rates) + " |")
+    print("|---|---|" + "---|" * len(rates))
+    totals = [0.0] * len(rates)
+    for name, toks, eff in OWN_PLAN:
+        days = [toks / (r * eff) / 86400 for r in rates]
+        totals = [t + d for t, d in zip(totals, days)]
+        print(f"| {name} | {toks / 1e9:.1f}B | " + " | ".join(f"{d:.1f} d" for d in days) + " |")
+    print("| **total** | | " + " | ".join(f"**{t:.0f} d**" for t in totals) + " |")
+    print("\nRL and teacher-data generation run on the Sparks in parallel and are not on this critical path.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--spark-offload", action="store_true",
                     help="run small ablations and SFT on the two DGX Sparks instead of rented GPUs")
+    ap.add_argument("--own-tok-s", type=float, nargs="+",
+                    help="training tokens/s measured on your own GPU(s) (scripts/bench_train.py): print a timeline")
     args = ap.parse_args()
+    if args.own_tok_s:
+        own_timeline(args.own_tok_s)
+        return
     cfg = get_config("cirrus-s-1a")
     print(f"# cirrus-s-1a training budget ({cfg.total_params() / 1e6:.0f}M params"
           f"{', ablations + SFT on the Sparks' if args.spark_offload else ''})\n")

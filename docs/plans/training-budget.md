@@ -73,3 +73,38 @@ Running the small ablations and SFT on the two DGX Sparks instead
 4. **Rule-based counterfactuals** for nearly all of the 15% counterfactual mix.
 5. **Prefix-cached / batch API pricing** for teacher trajectories: every turn re-sends the same
    sources, so caching cuts input cost severalfold.
+
+## Own hardware: one RTX 4090 trains, the two Sparks support it
+
+Decision (2026-10-24): train on our own hardware, not rented GPUs. A single RTX 4090 is the best
+trainer we have for a 155M model: ~165 TFLOPS dense BF16 (FP32 accumulate) and ~1 TB/s memory
+bandwidth, versus the Spark's ~93 TFLOPS achieved and 273 GB/s. Small-model training is largely
+bandwidth-bound (norms, activations, optimizer), and Ada (sm_89) has mature Triton /
+flash-linear-attention support. Weights + gradients + AdamW state are ~2.5 GB, so 24 GB is
+ample.
+
+**Expected throughput: 40-70K tokens/s** (26-45% MFU; `scripts/bench_train.py` measures it).
+At that rate the 1-1.5T-token plan would take 8-14 months, so the own-hardware plan uses the
+lean recipe instead:
+
+| phase | tokens | 40K tok/s | 55K tok/s | 70K tok/s |
+|---|---|---|---|---|
+| ablations (6 × 3B) | 18B | 5.2 d | 3.8 d | 3.0 d |
+| pretrain | 200B | 57.9 d | 42.1 d | 33.1 d |
+| mid-train (8K-64K ctx) | 25B | 12.1 d | 8.8 d | 6.9 d |
+| SFT (3 epochs) | 1.5B | 0.4 d | 0.3 d | 0.2 d |
+| **total** | | **76 d** | **55 d** | **43 d** |
+
+- **Data:** about 200B tokens of the densest reading-focused data: PleIAs SYNTH (≈75B, 1-2
+  passes; Baguettotron-321M reached state of the art for its size on ~200B SYNTH tokens),
+  FinePhrase FAQ/table, top-scored FineWeb-Edu, and Dolmino QA. The goal is a strong reader,
+  not an encyclopedia, which this recipe favors anyway.
+- **The Sparks in parallel:** teacher-trajectory generation with a large local model (128 GB
+  holds it), tokenization (20 Arm cores each), evaluation, RL rollouts with the fast engine,
+  and the speed work. Spark prefill is slow, so teacher trajectories use snippet-length
+  contexts and target 50-80K kept trajectories rather than 200K.
+- **Cost:** electricity only, plus optional API spend for teacher data if local generation is
+  too slow. A 4090 at ~450 W for ~2 months is about 650 kWh.
+- **Risks:** a consumer card running for weeks (no ECC; checkpoint often), WSL2 if the 4090 is
+  in a Windows machine (Triton needs Linux; WSL2 works), and 200B tokens being enough for
+  multi-source reasoning at 155M. The ablations test that before the long run.

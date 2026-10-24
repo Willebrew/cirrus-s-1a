@@ -158,7 +158,8 @@ class GatedDeltaNet(nn.Module):
         beta = b.sigmoid()
         scale = self.dk**-0.5
         if _fla_chunk_gdr is not None and x.is_cuda and T > 1:
-            o, S = _fla_chunk_gdr(q, k, v, g, beta, scale=scale, initial_state=S0, output_final_state=True)
+            # fla wants beta in the activation dtype; the log-decay g stays fp32
+            o, S = _fla_chunk_gdr(q, k, v, g, beta.to(q.dtype), scale=scale, initial_state=S0, output_final_state=True)
         else:
             o, S = gated_delta_rule_ref(q, k, v, g, beta, scale, S0)
         o = self.o_norm(o) * F.silu(self.gate(x)).view(B, T, self.H, self.dv)
