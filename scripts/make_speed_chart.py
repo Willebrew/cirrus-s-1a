@@ -71,13 +71,13 @@ svg{{position:absolute;left:0;top:0}}
 .foot{{position:absolute;left:48px;right:48px;bottom:22px;font-size:12.5px;line-height:1.45;color:{C['t3']}}}
 </style></head><body><div class="card">
 {''.join(svg)}
-<div class="eyebrow">155M-parameter model · one NVIDIA DGX Spark</div>
+<div class="eyebrow">One NVIDIA DGX Spark</div>
 <div class="title">Projected decode speed, kernel by kernel</div>
 <div class="legend"><span><i class="dot" style="background:{C['s1']}"></i>τ = 2.5 accepted tokens per step</span>
 <span><i class="dot" style="background:{C['s2']}"></i>τ = 1.65 (conservative)</span></div>
 <div class="hero"><div class="n">4,372</div><div class="u">tok/s projected · τ = 2.5 · 32K context</div>
 <div class="s">weight stream per step: 963 µs → 490 µs</div></div>
-<div class="foot">Projection, not an end-to-end run. The full 90.8 MB decode-step weight stream (4-bit NVFP4) was measured on a DGX Spark
+<div class="foot">Projection, not an end-to-end run. The full decode-step weight stream (4-bit NVFP4) was measured on a DGX Spark
 with random weights at the real model shapes; the remaining KV/state traffic is modeled. τ (accepted tokens per speculative-decoding
 step) is assumed until measured. The model is not trained yet.</div>
 </div></body></html>"""
