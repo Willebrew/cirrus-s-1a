@@ -181,11 +181,33 @@ def _repeat_kv(x: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def _attend(q, k, v, mask, n_rep: int):
-    """q: [B, T, Hq, D]; k, v: [B, Tk, Hkv, D]; mask: bool [B or 1, T, Tk]."""
+    """q: [B, T, Hq, D]; k, v: [B, Tk, Hkv, D]; mask: bool [B or 1, T, Tk], or None for plain
+    causal attention with T == Tk (no mask tensor, so SDPA can use FlashAttention)."""
     q, k, v = (t.transpose(1, 2) for t in (q, k, v))
     k, v = _repeat_kv(k, n_rep), _repeat_kv(v, n_rep)
-    o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:, None])
+    if mask is None:
+        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+    else:
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:, None])
     return o.transpose(1, 2)  # [B, T, Hq, D]
+
+
+def _sliding_window_attend(q, k, v, window: int, n_rep: int):
+    """Causal sliding-window attention over a whole sequence (no cache), block by block.
+
+    Queries in [s, s+W) can only see keys in (s-W, s+W), so each block reads at most
+    2W-1 keys: O(T*W) work and memory instead of O(T^2) for one T x T mask. Exact.
+    """
+    T = q.shape[1]
+    if T <= window:
+        return _attend(q, k, v, None, n_rep)
+    out = []
+    for s in range(0, T, window):
+        e, ks = min(s + window, T), max(0, s - window + 1)
+        diff = torch.arange(s, e, device=q.device)[:, None] - torch.arange(ks, e, device=q.device)[None, :]
+        mask = ((diff >= 0) & (diff < window))[None]
+        out.append(_attend(q[:, s:e], k[:, ks:e], v[:, ks:e], mask, n_rep))
+    return torch.cat(out, dim=1)
 
 
 class SlidingWindowAttention(nn.Module):
@@ -211,11 +233,13 @@ class SlidingWindowAttention(nn.Module):
         if cache:
             k = torch.cat((cache["k"], k), dim=1)
             v = torch.cat((cache["v"], v), dim=1)
-        Tk = k.shape[1]
-        kpos = torch.arange(pos[-1] - Tk + 1, pos[-1] + 1, device=x.device)
-        diff = pos[:, None] - kpos[None, :]
-        mask = ((diff >= 0) & (diff < c.swa_window))[None]
-        o = _attend(q, k, v, mask, c.n_q_heads // c.n_kv_heads)
+            Tk = k.shape[1]
+            kpos = torch.arange(pos[-1] - Tk + 1, pos[-1] + 1, device=x.device)
+            diff = pos[:, None] - kpos[None, :]
+            mask = ((diff >= 0) & (diff < c.swa_window))[None]
+            o = _attend(q, k, v, mask, c.n_q_heads // c.n_kv_heads)
+        else:  # whole sequence (training, prefill): blockwise, never a T x T mask
+            o = _sliding_window_attend(q, k, v, c.swa_window, c.n_q_heads // c.n_kv_heads)
         o = o * self.gate(x).sigmoid()[..., None]
         keep = c.swa_window
         new_cache = {"k": k[:, -keep:].detach(), "v": v[:, -keep:].detach()}

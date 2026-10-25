@@ -145,12 +145,15 @@ class CirrusModel(nn.Module):
         # ---------------------------------------------------- cross-decoder
         nq = T if n_logits is None else min(n_logits, T)
         x, qpos = h[:, -nq:], pos[-nq:]
-        kpos = torch.arange(Tk, device=dev)
-        causal = (kpos[None, :] <= qpos[:, None])[None]  # [1, nq, Tk]
-        mask, scores = causal, None
-        if cfg.sparse_topk is not None:
-            scores = indexer_scores(skv["iq"][:, -nq:], skv["iw"][:, -nq:], skv["ik"])
-            mask = topk_mask(scores, causal, cfg.sparse_topk)
+        scores = None
+        if cfg.sparse_topk is None and nq == Tk:
+            mask = None  # dense and square (pretraining): plain causal, no [T, T] mask -> FlashAttention
+        else:
+            kpos = torch.arange(Tk, device=dev)
+            mask = (kpos[None, :] <= qpos[:, None])[None]  # causal, [1, nq, Tk]
+            if cfg.sparse_topk is not None:
+                scores = indexer_scores(skv["iq"][:, -nq:], skv["iw"][:, -nq:], skv["ik"])
+                mask = topk_mask(scores, mask, cfg.sparse_topk)
         probs0 = None
         for j, blk in enumerate(self.cross_layers):
             want_probs = indexer_weight > 0 and j == 0 and scores is not None

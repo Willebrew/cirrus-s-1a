@@ -128,3 +128,30 @@ def test_chunked_loss_matches_full_logits():
     ref.backward()
     torch.testing.assert_close(out.loss, ref)
     torch.testing.assert_close(g_chunk, m.embed.weight.grad)
+
+
+def test_fast_attention_paths_match_explicit_masks():
+    from cirrus.model.layers import _attend, _sliding_window_attend
+
+    B, T, Hq, Hkv, D = 2, 37, 4, 2, 8
+    q, k, v = torch.randn(B, T, Hq, D), torch.randn(B, T, Hkv, D), torch.randn(B, T, Hkv, D)
+    i = torch.arange(T)
+    diff = i[:, None] - i[None, :]
+    torch.testing.assert_close(_attend(q, k, v, None, 2), _attend(q, k, v, (diff >= 0)[None], 2))
+    for w in (1, 5, 8, 37, 50):  # window smaller than, equal to, larger than T; ragged last block
+        ref = _attend(q, k, v, ((diff >= 0) & (diff < w))[None], 2)
+        torch.testing.assert_close(_sliding_window_attend(q, k, v, w, 2), ref)
+
+
+def test_dense_full_forward_uses_no_mask_and_matches_decode():
+    # the dense square path (no mask tensor) must agree with incremental decode (explicit masks)
+    m = model(sparse_topk=None, swa_window=4)
+    ids = torch.randint(0, m.cfg.vocab_size, (1, 15))
+    full = m(ids).logits
+    out = m(ids[:, :3], use_cache=True)
+    steps, cache = [out.logits], out.cache
+    for t in range(3, 15):
+        o = m(ids[:, t : t + 1], cache=cache)
+        steps.append(o.logits)
+        cache = o.cache
+    torch.testing.assert_close(torch.cat(steps, 1), full)
