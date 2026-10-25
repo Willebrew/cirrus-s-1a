@@ -56,6 +56,10 @@ throughput is ≥ 3,000 tok/s at τ ≥ 1.65. Phase 1 confirms it on hardware; `
   answer-after. To run on the Sparks.
 - [x] Pretraining loop for one GPU: Muon + AdamW, WSD with a saved branch point, bf16
   autocast, chunked LM-head loss, exact resume, per-source val (`scripts/train.py`).
+- [x] Rule-built protocol transcripts from HotpotQA + SQuAD 2.0 (`cirrus/data/episodes.py`,
+  `scripts/make_episodes.py`): answerable with quoted, cited evidence; counterfactual (answer
+  swapped in every source); unanswerable (`<|insufficient|>`). Harness text is loss-masked.
+  Verified by replaying transcripts through the real agent loop. For mid-training and SFT warmup.
 - [ ] Offline search environment: BM25 + small dense retriever over wiki-18, a FineWeb-Edu slice,
   a frozen fresh Common Crawl snapshot and BrowseComp-Plus, with a counterfactual rewriter.
 

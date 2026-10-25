@@ -15,6 +15,9 @@ reboot or Ctrl-C.
 | 4. ablations | 4090 | `python scripts/train.py --data data/ablate --out runs/abl-muon --tokens 3e9` (and variants) | ~43 h each at the measured 19K tok/s (eager) |
 | 5. pretrain | 4090 | `python scripts/train.py --data data/lean --out runs/lean --tokens 200e9 --compile` | 6-11 weeks |
 
+Protocol transcripts for mid-training and SFT (CPU, a few minutes, any machine):
+`python scripts/make_episodes.py --out data/episodes/train.jsonl` (and `--split validation`).
+
 Steps 2-3 run while step 4 trains; the full data set is only needed at step 5.
 
 ## Setup

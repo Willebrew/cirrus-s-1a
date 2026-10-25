@@ -171,7 +171,8 @@ class CirrusModel(nn.Module):
             out.cache = Cache(new_layers, {k: skv[k].detach() for k in ("k", "v", "ik") if k in skv}, start + T)
 
         if labels is not None:
-            out.loss, out.metrics = self._loss(input_ids, labels, hn, x, scores, probs0, mask, mtp_weight, indexer_weight)
+            out.loss, out.metrics = self._loss(input_ids, labels, hn, x, scores, probs0, mask, mtp_weight,
+                                               indexer_weight)
         return out
 
     # ----------------------------------------------------------------- loss
