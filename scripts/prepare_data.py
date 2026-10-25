@@ -37,7 +37,7 @@ def worker(name: str, rank: int, world: int, budget: int, a: dict) -> dict:
     tok = CirrusTokenizer(a["tokenizer"])
     src = SOURCES[name]
     st = write_source(
-        stream=lambda: src.stream(rank, world),
+        stream=lambda state: src.stream(rank, world, state),  # state: exact resume point, or None
         encode_batch=tok.encode_batch,
         eos_id=tok.eos_id,
         out=Path(a["out"]),

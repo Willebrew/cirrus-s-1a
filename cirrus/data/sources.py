@@ -34,12 +34,7 @@ class Source:
         nobody downloads rows they throw away. ``state`` resumes exactly
         where a previous ``state_dict()`` was taken.
         """
-        from datasets import load_dataset
-
-        if self.builder:
-            ds = load_dataset(self.builder, data_files=self.data_files, split=self.split, streaming=True)
-        else:
-            ds = load_dataset(self.repo, self.config, split=self.split, streaming=True)
+        ds = self.load()
         if world > 1:
             if ds.num_shards < world:
                 raise ValueError(f"{self.name} has {ds.num_shards} files, fewer than {world} workers")
@@ -47,6 +42,14 @@ class Source:
         if state is not None:
             ds.load_state_dict(state)
         return DocStream(ds, self.render)
+
+    def load(self):
+        """The streaming ``datasets.IterableDataset`` for this source."""
+        from datasets import load_dataset
+
+        if self.builder:
+            return load_dataset(self.builder, data_files=self.data_files, split=self.split, streaming=True)
+        return load_dataset(self.repo, self.config, split=self.split, streaming=True)
 
 
 class DocStream:

@@ -12,7 +12,7 @@ reboot or Ctrl-C.
 | 1. tokenizer | Spark A | `python scripts/train_tokenizer.py` | ~1-2 h |
 | 2. ablation data | Spark A | `python scripts/prepare_data.py --tokens 3e9 --out data/ablate` | ~1-3 h |
 | 3. full data | Spark A + B | `python scripts/prepare_data.py --tokens 200e9 --out data/lean` | ~1-3 days, download-bound |
-| 4. ablations | 4090 | `python scripts/train.py --data data/ablate --out runs/abl-muon --tokens 3e9` (and variants) | ~15-20 h each |
+| 4. ablations | 4090 | `python scripts/train.py --data data/ablate --out runs/abl-muon --tokens 3e9` (and variants) | ~43 h each at the measured 19K tok/s (eager) |
 | 5. pretrain | 4090 | `python scripts/train.py --data data/lean --out runs/lean --tokens 200e9 --compile` | 6-11 weeks |
 
 Steps 2-3 run while step 4 trains; the full data set is only needed at step 5.
@@ -80,7 +80,7 @@ python scripts/prepare_data.py --tokens 200e9 --out data/lean --sources fineweb_
 
 ## 4. Ablations (decide before the long run)
 
-Each ablation is 3B tokens, about 15-20 hours on the 4090 at the expected 40-70K tok/s.
+Each ablation is 3B tokens: about 43 hours on the 4090 at the measured 19,241 tok/s (eager, micro 2).
 Compare `val ce` per source at equal tokens (all runs log to `runs/<name>/log.jsonl`).
 
 | # | question | runs |

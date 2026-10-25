@@ -81,6 +81,22 @@ def check_fla() -> dict:
     return out
 
 
+# Out-of-memory can surface as either: under Windows/WSL2 the driver first spills to
+# system RAM (no error, but a collapse in speed), then fails with a generic CUDA error.
+OOM_ERRORS = tuple(e for e in (torch.cuda.OutOfMemoryError, getattr(torch, "AcceleratorError", None)) if e)
+MEM_LIMIT = 0.90  # a micro-batch reserving more than this fraction of the card is too big
+COLLAPSE = 0.5  # ... and so is one slower than this fraction of the best smaller micro-batch
+
+
+def too_big(r: dict, total_gb: float, best_tok_s: float) -> str | None:
+    """Why this micro-batch should not be used, or None if it is fine."""
+    if r["reserved_gb"] > MEM_LIMIT * total_gb:
+        return f"reserved {r['reserved_gb']} GB of {total_gb} GB (likely spilling to system RAM)"
+    if best_tok_s and r["tok_s"] < COLLAPSE * best_tok_s:
+        return f"{r['tok_s']:,} tok/s vs {best_tok_s:,} at a smaller micro-batch (likely spilling to system RAM)"
+    return None
+
+
 def time_steps(model, opts, micro: int, seq: int, steps: int, warmup: int, vocab: int, mtp: float) -> dict:
     torch.cuda.reset_peak_memory_stats()
     ids = torch.randint(0, vocab, (micro, seq), device="cuda")
@@ -98,6 +114,7 @@ def time_steps(model, opts, micro: int, seq: int, steps: int, warmup: int, vocab
     torch.cuda.synchronize()
     dt = (time.perf_counter() - t0) / steps
     return {"micro": micro, "step_s": round(dt, 4), "tok_s": round(micro * seq / dt),
+            "reserved_gb": round(torch.cuda.max_memory_reserved() / 1e9, 2),
             "peak_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2), "loss": round(out.loss.item(), 3)}
 
 
@@ -139,7 +156,32 @@ def main() -> None:
 
     flops_per_token = 6 * cfg.total_params() * 1.15  # +~15% attention / GDN mixing at 4K context
     peak = PEAK_TFLOPS.get(cap)
-    rows = []
+    finish_sweep(args, cfg, CirrusModel, report, flops_per_token, peak)
+
+
+def finish_sweep(args, cfg, CirrusModel, report: dict, flops_per_token: float, peak: float | None) -> None:
+    """Run the sweep and write the report, even if the sweep dies part way."""
+    rows: list = []
+    try:
+        sweep(args, cfg, CirrusModel, rows, flops_per_token, peak, report.get("mem_gb", 0.0))
+    finally:  # whatever happened, keep what was measured
+        report["runs"] = rows
+        usable = [r for r in rows if not r.get("too_big")]
+        if usable:
+            best = max(usable, key=lambda r: r["tok_s"])
+            report["best"] = best
+            tps = best["tok_s"]
+            print(f"\nbest: {tps:,} tok/s (micro {best['micro']}, {'compiled' if best['compiled'] else 'eager'})")
+            print("time on this one GPU:")
+            for label, toks in (("ablation, 3B tokens", 3e9), ("pretrain, 100B", 100e9), ("pretrain, 200B", 200e9),
+                                ("pretrain, 500B", 500e9), ("pretrain, 1.5T", 1.5e12)):
+                days = toks / tps / 86400
+                print(f"   {label:22s} {days:7.1f} days" if days >= 1 else f"   {label:22s} {days * 24:7.1f} hours")
+            report["days_per_100B"] = round(100e9 / tps / 86400, 1)
+        write_report(args, report)
+
+
+def sweep(args, cfg, CirrusModel, rows: list, flops_per_token: float, peak: float | None, total_gb: float) -> None:
     for compiled in ([False, True] if args.compile else [False]):
         torch.manual_seed(0)
         # same recipe as scripts/train.py: fp32 master weights, bf16 autocast, Muon + AdamW
@@ -147,34 +189,32 @@ def main() -> None:
         opts = build_optimizers(model, args.optim, 2e-3, 0.1)
         fwd = torch.compile(model) if compiled else model
         print(f"\n== training step, seq {args.seq}, {'torch.compile' if compiled else 'eager'} ==")
+        best_tok_s = 0
         for micro in args.micro:
             try:
                 r = time_steps(fwd, opts, micro, args.seq, args.steps, args.warmup, cfg.vocab_size, args.mtp)
-            except torch.cuda.OutOfMemoryError:
-                print(f"   micro {micro:2d}: out of memory")
+            except OOM_ERRORS as e:
+                print(f"   micro {micro:2d}: out of memory ({type(e).__name__})")
+                rows.append({"micro": micro, "compiled": compiled, "too_big": f"{type(e).__name__}: {e}"[:300]})
+                if not isinstance(e, torch.cuda.OutOfMemoryError):
+                    return  # a generic CUDA error can leave the context unusable: stop measuring
                 torch.cuda.empty_cache()
                 break
             r["compiled"] = compiled
             r["mfu"] = round(r["tok_s"] * flops_per_token / (peak * 1e12), 3) if peak else None
+            r["too_big"] = too_big(r, total_gb, best_tok_s)
             rows.append(r)
             print(f"   micro {micro:2d}: {r['tok_s']:>9,d} tok/s  step {r['step_s'] * 1e3:7.1f} ms  "
-                  f"peak {r['peak_gb']:5.1f} GB  MFU {r['mfu']}  loss {r['loss']}")
+                  f"peak {r['peak_gb']:5.1f} GB (reserved {r['reserved_gb']:5.1f})  MFU {r['mfu']}  loss {r['loss']}"
+                  + (f"\n            too big: {r['too_big']}" if r["too_big"] else ""))
+            if r["too_big"]:
+                break  # larger micro-batches only get worse
+            best_tok_s = max(best_tok_s, r["tok_s"])
         del model, opts, fwd
         torch.cuda.empty_cache()
 
-    report["runs"] = rows
-    if rows:
-        best = max(rows, key=lambda r: r["tok_s"])
-        report["best"] = best
-        tps = best["tok_s"]
-        print(f"\nbest: {tps:,} tok/s (micro {best['micro']}, {'compiled' if best['compiled'] else 'eager'})")
-        print("time on this one GPU:")
-        for label, toks in (("ablation, 3B tokens", 3e9), ("pretrain, 100B", 100e9), ("pretrain, 200B", 200e9),
-                            ("pretrain, 500B", 500e9), ("pretrain, 1.5T", 1.5e12)):
-            days = toks / tps / 86400
-            print(f"   {label:22s} {days:7.1f} days" if days >= 1 else f"   {label:22s} {days * 24:7.1f} hours")
-        report["days_per_100B"] = round(100e9 / tps / 86400, 1)
 
+def write_report(args, report: dict) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"train-{socket.gethostname()}-{time.strftime('%Y%m%d-%H%M%S')}.json"
