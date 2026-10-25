@@ -36,6 +36,7 @@ sys.path.insert(0, str(ROOT))
 import torch  # noqa: E402
 
 from cirrus.config import get_config  # noqa: E402
+from cirrus.train.compile import compile_layers  # noqa: E402
 from cirrus.train.optim import build_optimizers  # noqa: E402
 
 # dense BF16 tensor throughput with FP32 accumulation, TFLOPS: spec for the
@@ -125,7 +126,7 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--mtp", type=float, default=0.3, help="MTP loss weight (0 disables the MTP passes)")
-    ap.add_argument("--compile", action="store_true", help="also try torch.compile")
+    ap.add_argument("--compile", action="store_true", help="also try torch.compile (per layer)")
     ap.add_argument("--optim", default="muon", choices=["muon", "adamw"])
     ap.add_argument("--allow-slow", action="store_true", help="run even without the fused GDN kernel")
     ap.add_argument("--out", default=str(ROOT / "results" / "local"))
@@ -187,7 +188,9 @@ def sweep(args, cfg, CirrusModel, rows: list, flops_per_token: float, peak: floa
         # same recipe as scripts/train.py: fp32 master weights, bf16 autocast, Muon + AdamW
         model = CirrusModel(cfg).cuda().train()
         opts = build_optimizers(model, args.optim, 2e-3, 0.1)
-        fwd = torch.compile(model) if compiled else model
+        if compiled:  # per layer, as scripts/train.py does (whole-model compile hits an Inductor bug)
+            compile_layers(model)
+        fwd = model
         print(f"\n== training step, seq {args.seq}, {'torch.compile' if compiled else 'eager'} ==")
         best_tok_s = 0
         for micro in args.micro:

@@ -84,3 +84,27 @@ def test_optim_pieces():
     assert wsd_lr(0, 100, 10, 0.2) == pytest.approx(0.1)
     assert wsd_lr(50, 100, 10, 0.2) == 1.0
     assert wsd_lr(99, 100, 10, 0.2) < 0.25 and wsd_lr(80, 100, 10, 0.2) == 1.0
+
+
+def test_compile_layers_matches_eager():
+    from dataclasses import replace
+
+    from cirrus.config import get_config
+    from cirrus.model.model import CirrusModel
+    from cirrus.train.compile import compile_layers
+
+    torch.manual_seed(0)
+    cfg = replace(get_config("cirrus-s-1a-debug"), sparse_topk=None)
+    eager = CirrusModel(cfg).train()
+    comp = CirrusModel(cfg).train()
+    comp.load_state_dict(eager.state_dict())
+    assert compile_layers(comp) == 4 * (cfg.n_self_layers + cfg.n_cross_layers)
+    assert comp.state_dict().keys() == eager.state_dict().keys()
+    ids = torch.randint(0, cfg.vocab_size, (2, 24))
+    for m in (eager, comp):
+        m(ids, labels=ids, mtp_weight=0.3).loss.backward()  # MTP on: the shapes that broke whole-model compile
+    le = eager(ids, labels=ids, mtp_weight=0.3).loss
+    lc = comp(ids, labels=ids, mtp_weight=0.3).loss
+    torch.testing.assert_close(lc, le, rtol=1e-4, atol=1e-4)
+    for (n, pe), pc in zip(eager.named_parameters(), comp.parameters()):
+        torch.testing.assert_close(pc.grad, pe.grad, rtol=1e-3, atol=1e-5, msg=n)

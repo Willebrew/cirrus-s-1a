@@ -68,6 +68,13 @@ stream position with every shard, so a resume jumps straight back to where it st
 Rank 0 of each source holds out the first ~2M tokens as `val/<source>.bin`; the trainer
 reports validation loss per source, which is what the ablations compare.
 
+**Memory.** `--workers` sets how many slices the data is split into (locked once an `--out`
+directory exists, since each slice's resume point lives in its own files); `--procs` sets how
+many run at once and can change on every run. By default `--procs` fits `--max-mem-gb 20` at
+~2 GB per process (shards stream to disk; the remaining cost is one decoded parquet row group
+of the columns we render). Each progress line prints that worker's RSS: if it runs higher on
+some source, lower `--max-mem-gb` or pass `--procs` explicitly.
+
 To split step 3 across both Sparks, give each a disjoint `--sources` list with otherwise
 identical arguments, then merge the `train/` and `val/` directories:
 

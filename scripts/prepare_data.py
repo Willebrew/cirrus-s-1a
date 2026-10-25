@@ -7,9 +7,14 @@ command after any interruption and it continues where it stopped.
     python scripts/prepare_data.py --tokens 200e9 --out data/lean     # the full lean recipe (~400 GB)
 
 Each (source, worker) pair streams its slice of the dataset from the Hub and
-writes uint16 shards of ~500M tokens (1 GB) cut at document boundaries.
-Rank 0 of each source also writes a held-out val file. On a DGX Spark use
-about one worker per core; the Hub download is usually the bottleneck.
+writes uint16 shards of ~100M tokens (200 MB) cut at document boundaries,
+straight to disk. Rank 0 of each source also writes a held-out val file.
+
+Memory: --workers is how many slices the data is split into (fixed for the
+life of an output directory); --procs is how many run at once (free to
+change between runs). Each process needs roughly PROC_GB of RAM, so by
+default --procs is chosen to fit --max-mem-gb. The Hub download is usually
+the bottleneck, so a few processes lose little.
 """
 
 from __future__ import annotations
@@ -27,6 +32,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from cirrus.data.sources import MIXES, SOURCES  # noqa: E402
+
+# Per-process RAM: ~0.2 GB for the interpreter, pyarrow and tokenizer, plus one decoded parquet row
+# group of the rendered columns (Arrow decodes a whole column chunk even when reading small batches).
+# ~1 GB measured on a 375 MB single-row-group file; 2 GB leaves headroom for SYNTH's larger files.
+PROC_GB = 2.0
 
 
 def worker(name: str, rank: int, world: int, budget: int, a: dict) -> dict:
@@ -52,15 +62,40 @@ def worker(name: str, rank: int, world: int, budget: int, a: dict) -> dict:
     return {"source": name, "rank": rank, "tokens": st.tokens, "budget": budget, "exhausted": st.exhausted}
 
 
+def reconcile_manifest(mpath: Path, manifest: dict) -> dict:
+    """Merge a new run's manifest with the one already in --out (if any).
+
+    The mix, budgets and tokenizer must match. The slice count is kept from
+    the first run: each slice's resume state is a position within *its own*
+    files, so re-slicing would orphan finished work and re-read or skip data.
+    How many slices run at once (--procs) is free to change.
+    """
+    if not mpath.exists():
+        return manifest
+    old = json.loads(mpath.read_text())
+    for k in ("mix", "budgets", "tokenizer_hash"):
+        if old.get(k) != manifest[k]:
+            sys.exit(f"{mpath.parent} was started with a different {k} ({old.get(k)} vs {manifest[k]}); "
+                     "use a new --out or the original arguments")
+    if old["workers"] != manifest["workers"]:
+        print(f"note: {mpath.parent} was split into {sum(old['workers'].values())} slices; keeping that split "
+              "(--workers only applies to a new --out; use --procs to run fewer at once)")
+    return {**manifest, "workers": old["workers"], "written": old.get("written", {})}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mix", default="lean", choices=sorted(MIXES))
     ap.add_argument("--tokens", type=float, required=True, help="total train tokens across sources")
     ap.add_argument("--out", required=True)
     ap.add_argument("--tokenizer", default=str(ROOT / "tokenizer" / "cirrus-32k.json"))
-    ap.add_argument("--workers", type=int, default=os.cpu_count() or 4)
+    ap.add_argument("--workers", type=int, default=os.cpu_count() or 4,
+                    help="slices to split the data into (locked once an --out directory is started)")
+    ap.add_argument("--procs", type=int, default=None,
+                    help="worker processes running at once (default: as many as fit --max-mem-gb)")
+    ap.add_argument("--max-mem-gb", type=float, default=20.0, help="RAM budget for all worker processes")
     ap.add_argument("--val-tokens", type=float, default=2e6, help="held-out tokens per source")
-    ap.add_argument("--shard-tokens", type=float, default=5e8)
+    ap.add_argument("--shard-tokens", type=float, default=1e8, help="tokens per shard file (resume granularity)")
     ap.add_argument("--sources", default=None,
                     help="comma-separated subset of the mix to write here (split the work across machines, "
                          "then merge the train/ and val/ directories)")
@@ -77,13 +112,8 @@ def main() -> None:
                 "tokenizer": str(args.tokenizer), "tokenizer_bytes": len(tok_bytes),
                 "tokenizer_hash": hashlib.sha256(tok_bytes).hexdigest()[:16]}
     mpath = out / "manifest.json"
-    if mpath.exists():
-        old = json.loads(mpath.read_text())
-        for k in ("mix", "budgets", "workers", "tokenizer_hash"):
-            if old.get(k) != manifest[k]:
-                sys.exit(f"{out} was started with a different {k} ({old.get(k)} vs {manifest[k]}); "
-                         "use a new --out or the original arguments")
-        manifest["written"] = old.get("written", {})
+    manifest = reconcile_manifest(mpath, manifest)
+    share = manifest["workers"]
     mpath.write_text(json.dumps(manifest, indent=1))
 
     a = {"tokenizer": args.tokenizer, "out": str(out), "val_tokens": int(args.val_tokens),
@@ -94,12 +124,16 @@ def main() -> None:
         sys.exit(f"--sources not in the {args.mix} mix: {sorted(unknown)}")
     tasks = [(name, r, share[name], budgets[name] // share[name] + (budgets[name] % share[name] if r == 0 else 0))
              for name in mine for r in range(share[name])]
-    print(f"{args.mix} mix, {args.tokens / 1e9:.1f}B tokens -> {out}")
+    procs = args.procs or max(1, int(args.max_mem_gb // PROC_GB))
+    procs = min(procs, len(tasks))
+    print(f"{args.mix} mix, {args.tokens / 1e9:.1f}B tokens -> {out}, {len(tasks)} slices, {procs} at a time "
+          f"(~{procs * PROC_GB:.0f} GB RAM)")
     for name in mine:
-        print(f"   {name:18s} {budgets[name] / 1e9:7.2f}B tokens, {share[name]} workers")
+        print(f"   {name:18s} {budgets[name] / 1e9:7.2f}B tokens, {share[name]} slices")
     t0 = time.time()
     results = []
-    with ProcessPoolExecutor(max_workers=len(tasks)) as ex:
+    # a fresh process per slice, so memory a finished slice leaves behind (arrow pools) is returned
+    with ProcessPoolExecutor(max_workers=procs, max_tasks_per_child=1) as ex:
         futs = [ex.submit(worker, *t, a) for t in tasks]
         for f in as_completed(futs):
             r = f.result()

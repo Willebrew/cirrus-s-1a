@@ -39,6 +39,7 @@ import torch  # noqa: E402
 from cirrus.config import ModelConfig, get_config  # noqa: E402
 from cirrus.data.shards import TokenWindows, train_files, val_files  # noqa: E402
 from cirrus.model.model import CirrusModel  # noqa: E402
+from cirrus.train.compile import compile_layers  # noqa: E402
 from cirrus.train.optim import build_optimizers, decay_start, wsd_lr  # noqa: E402
 
 # dense BF16 tensor TFLOPS (FP32 accumulate) for MFU: RTX 4090 spec, GB10 measured (run 1)
@@ -159,7 +160,9 @@ def main(argv=None) -> dict:
         step = state["step"]
         print(f"resumed from {ck} at step {step:,}")
         del state
-    fwd = torch.compile(model) if args.compile else model
+    if args.compile:  # per layer: whole-model compile hits an Inductor bug (cirrus/train/compile.py)
+        print(f"compiled {compile_layers(model)} layer modules")
+    fwd = model
 
     per_micro = args.micro * args.seq
     if args.batch_tokens % per_micro:

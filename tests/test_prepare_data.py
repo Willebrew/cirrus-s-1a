@@ -105,3 +105,56 @@ def test_worker_resumes_from_stream_state(local_source, tmp_path):
     assert np.array_equal(_rank_tokens(tmp_path / "clean", 0), _rank_tokens(tmp_path / "crashed", 0))
     assert np.array_equal(np.fromfile(val_files(tmp_path / "clean")["local"], dtype=np.uint16),
                           np.fromfile(val_files(tmp_path / "crashed")["local"], dtype=np.uint16))
+
+
+def test_parquet_source_reads_bounded_batches_and_resumes(tmp_path, monkeypatch):
+    """A hub-style parquet repo (YAML configs, one big row group): only the rendered columns
+    are read, in PARQUET_BATCH_ROWS-row batches, and a saved state resumes mid row group."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    repo = tmp_path / "repo"
+    (repo / "faq").mkdir(parents=True)
+    (repo / "README.md").write_text("---\nconfigs:\n- config_name: faq\n  data_files:\n  - split: train\n"
+                                    "    path: faq/*.parquet\n---\n")
+    n = 5000
+    table = pa.table({
+        "text": [f"document {i}" for i in range(n)],
+        "rollout_results": [[{"text": f"Q{i}? A{i}.", "finish_reason": "stop"}] for i in range(n)],
+        "unused_blob": ["x" * 2000] * n,  # must never be read
+    })
+    pq.write_table(table, repo / "faq" / "part0.parquet", row_group_size=n)  # one row group
+
+    seen_kwargs = {}
+    import datasets
+
+    real = datasets.load_dataset
+
+    def spy(*a, **kw):
+        seen_kwargs.update(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(datasets, "load_dataset", spy)
+    monkeypatch.setattr(sources, "PARQUET_BATCH_ROWS", 256)
+    src = sources.Source("t", str(repo), sources.render_finephrase("FAQ"), config="faq",
+                         columns=("text", "rollout_results"))
+    it = src.stream()
+    first = [next(it) for _ in range(700)]
+    assert seen_kwargs["columns"] == ["text", "rollout_results"] and seen_kwargs["batch_size"] == 256
+    assert first[0] == "document 0\n\nFAQ\n\nQ0? A0." and first[-1].startswith("document 699\n")
+    state = json.loads(json.dumps(it.state_dict()))
+    resumed = src.stream(state=state)
+    assert next(resumed).startswith("document 700\n")
+    assert "unused_blob" not in src.load().column_names
+
+
+def test_resume_keeps_the_original_slice_count(tmp_path, capsys):
+    m = {"mix": "lean", "budgets": {"a": 10}, "tokenizer_hash": "h", "workers": {"a": 32}}
+    mpath = tmp_path / "manifest.json"
+    mpath.write_text(json.dumps({**m, "written": {"a": 3}}))
+    merged = prepare_data.reconcile_manifest(mpath, {**m, "workers": {"a": 10}})
+    assert merged["workers"] == {"a": 32} and merged["written"] == {"a": 3}
+    assert "keeping that split" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        prepare_data.reconcile_manifest(mpath, {**m, "budgets": {"a": 11}})
+    assert prepare_data.reconcile_manifest(tmp_path / "none.json", m) is m

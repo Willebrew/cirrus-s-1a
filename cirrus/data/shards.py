@@ -88,8 +88,16 @@ def write_source(
     val_path = out / "val" / f"{name}.bin"
     collecting_val = rank == 0 and val_tokens > 0 and not val_path.exists()
     val: list[np.ndarray] = []
-    buf: list[np.ndarray] = []
-    buf_tokens = buf_docs = 0
+    # The shard being written grows on disk as <shard>.partial and is renamed when cut, so a
+    # worker holds one batch in memory, not a shard. A partial left by a killed run is redone.
+    shard_dir = out / "train" / name
+    for stale in shard_dir.glob(f"{rank:03d}_*.partial"):
+        stale.unlink()
+    part = None  # open file handle of the shard being written
+    part_tokens = part_docs = 0
+
+    def shard_path(suffix: str = "") -> Path:
+        return shard_dir / f"{rank:03d}_{st.shards:05d}.bin{suffix}"
 
     def save() -> None:
         _atomic_write_json(state_path, asdict(st))
@@ -101,60 +109,82 @@ def write_source(
                 next(it, None)
         return it
 
-    while not st.done:
-        it = open_stream()
-        exhausted = False
-        while st.tokens < budget:
-            bs = min(batch_docs, VAL_BATCH_DOCS) if collecting_val else batch_docs
-            batch = list(itertools.islice(it, bs))
-            exhausted = len(batch) < bs
-            arrs = []
-            for ids in encode_batch(batch) if batch else []:
-                arr = np.empty(len(ids) + 1, dtype=DTYPE)
-                arr[:-1] = ids
-                arr[-1] = eos_id
-                arrs.append(arr)
-            pos = it.state_dict() if hasattr(it, "state_dict") else None
-            if collecting_val:  # val takes whole batches
-                val += arrs
-                if sum(a.size for a in val) >= val_tokens or exhausted:
-                    if val:
-                        (out / "val").mkdir(exist_ok=True)
-                        _atomic_write_bytes(val_path, np.concatenate(val).tobytes())
-                    st.val_tokens, st.val_docs = int(sum(a.size for a in val)), len(val)
-                    st.docs_in_pass = st.val_docs
-                    st.stream_state = st.val_stream_state = pos
-                    collecting_val, val = False, []
-                    save()
-            else:
-                buf += arrs
-                buf_tokens += sum(a.size for a in arrs)
-                buf_docs += len(arrs)
-                if buf_tokens >= shard_tokens or st.tokens + buf_tokens >= budget or exhausted:
-                    if buf:
-                        arr = np.concatenate(buf)
-                        _atomic_write_bytes(out / "train" / name / f"{rank:03d}_{st.shards:05d}.bin", arr.tobytes())
-                        st.shards += 1
-                        st.tokens += int(arr.size)
-                        st.docs += buf_docs
-                        st.docs_in_pass += buf_docs
-                    st.stream_state = pos
-                    buf, buf_tokens, buf_docs = [], 0, 0
-                    save()
-                    log(f"[{name}/{rank}] shard {st.shards}: {st.tokens:,} / {budget:,} tokens, pass {st.passes}")
-            if exhausted:
-                break
-        if st.tokens >= budget:
-            st.done = True
-        elif exhausted:
-            st.passes += 1
-            if st.passes >= max_passes:
-                st.done = st.exhausted = True
-                log(f"[{name}/{rank}] data exhausted after {st.passes} passes at {st.tokens:,} tokens")
-            else:  # next pass starts just after the held-out val docs
-                st.docs_in_pass, st.stream_state = st.val_docs, st.val_stream_state
-        save()
+    try:
+        while not st.done:
+            it = open_stream()
+            exhausted = False
+            while st.tokens < budget:
+                bs = min(batch_docs, VAL_BATCH_DOCS) if collecting_val else batch_docs
+                batch = list(itertools.islice(it, bs))
+                exhausted = len(batch) < bs
+                arrs = []
+                for ids in encode_batch(batch) if batch else []:
+                    arr = np.empty(len(ids) + 1, dtype=DTYPE)
+                    arr[:-1] = ids
+                    arr[-1] = eos_id
+                    arrs.append(arr)
+                pos = it.state_dict() if hasattr(it, "state_dict") else None
+                if collecting_val:  # val takes whole batches
+                    val += arrs
+                    if sum(a.size for a in val) >= val_tokens or exhausted:
+                        if val:
+                            (out / "val").mkdir(exist_ok=True)
+                            _atomic_write_bytes(val_path, np.concatenate(val).tobytes())
+                        st.val_tokens, st.val_docs = int(sum(a.size for a in val)), len(val)
+                        st.docs_in_pass = st.val_docs
+                        st.stream_state = st.val_stream_state = pos
+                        collecting_val, val = False, []
+                        save()
+                else:
+                    if arrs:
+                        if part is None:
+                            part = open(shard_path(".partial"), "wb")
+                        np.concatenate(arrs).tofile(part)
+                        part_tokens += sum(a.size for a in arrs)
+                        part_docs += len(arrs)
+                    if part_tokens >= shard_tokens or st.tokens + part_tokens >= budget or exhausted:
+                        if part is not None:
+                            part.flush()
+                            os.fsync(part.fileno())
+                            part.close()
+                            part = None
+                            os.replace(shard_path(".partial"), shard_path())
+                            st.shards += 1
+                            st.tokens += part_tokens
+                            st.docs += part_docs
+                            st.docs_in_pass += part_docs
+                        st.stream_state = pos
+                        part_tokens = part_docs = 0
+                        save()
+                        log(f"[{name}/{rank}] shard {st.shards}: {st.tokens:,} / {budget:,} tokens, "
+                            f"pass {st.passes}{_rss()}")
+                if exhausted:
+                    break
+            if st.tokens >= budget:
+                st.done = True
+            elif exhausted:
+                st.passes += 1
+                if st.passes >= max_passes:
+                    st.done = st.exhausted = True
+                    log(f"[{name}/{rank}] data exhausted after {st.passes} passes at {st.tokens:,} tokens")
+                else:  # next pass starts just after the held-out val docs
+                    st.docs_in_pass, st.stream_state = st.val_docs, st.val_stream_state
+            save()
+    finally:
+        if part is not None:
+            part.close()
     return st
+
+
+def _rss() -> str:
+    """This process's resident memory, for the progress log (Linux only)."""
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("VmRSS:"):
+                return f", RSS {int(line.split()[1]) / 1e6:.2f} GB"
+    except OSError:
+        pass
+    return ""
 
 
 # ---------------------------------------------------------------- reading

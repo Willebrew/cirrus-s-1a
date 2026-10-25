@@ -154,3 +154,41 @@ def test_resume_uses_stream_state(tmp_path):
     write_source(lambda s: _Resumable(s), ENC, EOS, tmp_path / "crashed", "s", 0, **kw)
     assert _Resumable.opened_at[0] == 0 and _Resumable.opened_at[1] > 0  # jumped, did not re-read
     assert np.array_equal(_all_tokens(tmp_path / "clean"), _all_tokens(tmp_path / "crashed"))
+
+
+def test_writer_memory_does_not_grow_with_budget(tmp_path):
+    """Shards stream to disk: peak memory is about one batch, not one shard (or one whole budget)."""
+    import tracemalloc
+
+    doc = "y" * 400
+
+    def run(budget, out):
+        tracemalloc.start()
+        write_source(lambda s: iter([doc] * 100_000), ENC, EOS, out, "s", 0, budget=budget,
+                     shard_tokens=10**9, batch_docs=256, log=lambda m: None)  # one huge shard: worst case
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        return peak
+
+    small, large = run(400_000, tmp_path / "a"), run(8_000_000, tmp_path / "b")
+    assert large < 2 * small, (small, large)  # 20x the tokens, about the same peak
+    assert large < 8_000_000 * 2 / 4  # far below the 16 MB the shard itself occupies
+    assert not list((tmp_path / "b").rglob("*.partial"))
+
+
+def test_partial_shard_from_a_crash_is_redone(tmp_path):
+    kw = dict(budget=3000, shard_tokens=10**6, batch_docs=16, log=lambda m: None)  # one shard, many batches
+    write_source(lambda s: iter(DOCS), ENC, EOS, tmp_path / "clean", "s", 0, **kw)
+
+    def dies(state):
+        for i, d in enumerate(DOCS):
+            if i == 100:
+                raise RuntimeError("killed")
+            yield d
+
+    with pytest.raises(RuntimeError):
+        write_source(dies, ENC, EOS, tmp_path / "crashed", "s", 0, **kw)
+    assert list((tmp_path / "crashed").rglob("*.partial")) and not train_files(tmp_path / "crashed")
+    write_source(lambda s: iter(DOCS), ENC, EOS, tmp_path / "crashed", "s", 0, **kw)
+    assert not list((tmp_path / "crashed").rglob("*.partial"))
+    assert np.array_equal(_all_tokens(tmp_path / "clean"), _all_tokens(tmp_path / "crashed"))

@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 Row = dict
+PARQUET_BATCH_ROWS = 1024  # rows decoded at a time per worker
 Render = Callable[[Row], "str | None"]
 
 
@@ -25,6 +26,7 @@ class Source:
     data_files: str | list[str] | None = None  # for repos whose configs don't match their layout
     builder: str | None = None  # e.g. "json" for raw jsonl.zst files
     split: str = "train"
+    columns: tuple[str, ...] | None = None  # parquet: read only these (what render uses)
     note: str = ""
 
     def stream(self, rank: int = 0, world: int = 1, state: dict | None = None) -> DocStream:
@@ -47,9 +49,16 @@ class Source:
         """The streaming ``datasets.IterableDataset`` for this source."""
         from datasets import load_dataset
 
+        kw = {}
+        if self.builder in (None, "parquet"):
+            # By default datasets reads parquet one whole row group, all columns, at a time:
+            # hundreds of MB per worker on these files. Bound it.
+            kw["batch_size"] = PARQUET_BATCH_ROWS
+            if self.columns:
+                kw["columns"] = list(self.columns)
         if self.builder:
-            return load_dataset(self.builder, data_files=self.data_files, split=self.split, streaming=True)
-        return load_dataset(self.repo, self.config, split=self.split, streaming=True)
+            return load_dataset(self.builder, data_files=self.data_files, split=self.split, streaming=True, **kw)
+        return load_dataset(self.repo, self.config, split=self.split, streaming=True, **kw)
 
 
 class DocStream:
@@ -142,15 +151,18 @@ _DOLMINO = "hf://datasets/allenai/dolma3_dolmino_mix-100B-1025/data/"
 SOURCES: dict[str, Source] = {
     s.name: s
     for s in (
-        Source("synth", "PleIAs/SYNTH", render_synth(), note="~60B English tokens; RAG-style exercises"),
+        Source("synth", "PleIAs/SYNTH", render_synth(),
+               columns=("language", "query", "query_seed_text", "synthetic_answer"),
+               note="~60B English tokens; RAG-style exercises"),
         Source("finephrase_faq", "HuggingFaceFW/finephrase", render_finephrase("Frequently asked questions"),
-               config="faq", note="document followed by an FAQ written from it"),
+               config="faq", columns=("text", "rollout_results"), note="document followed by an FAQ written from it"),
         Source("finephrase_table", "HuggingFaceFW/finephrase", render_finephrase("Key facts"),
-               config="table", note="document followed by a table and one QA pair"),
+               config="table", columns=("text", "rollout_results"),
+               note="document followed by a table and one QA pair"),
         Source("finephrase_math", "HuggingFaceFW/finephrase", render_finephrase("Worked problem"),
-               config="math", note="numbers and arithmetic in context"),
+               config="math", columns=("text", "rollout_results"), note="numbers and arithmetic in context"),
         Source("fineweb_edu", "HuggingFaceFW/fineweb-edu", render_fineweb_edu(3.5), config="default",
-               note="explanatory web text, score >= 3.5"),
+               columns=("text", "score"), note="explanatory web text, score >= 3.5"),
         Source("dolmino_qa", "allenai/dolma3_dolmino_mix-100B-1025", render_text, builder="json",
                data_files=[_DOLMINO + "wiki_to_rcqa-part*/*.jsonl.zst", _DOLMINO + "nemotron-synth-qa/*.jsonl.zst",
                            _DOLMINO + "reddit_to_flashcards/**/*.jsonl.zst"],
