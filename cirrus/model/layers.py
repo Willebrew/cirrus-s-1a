@@ -25,6 +25,11 @@ except Exception:  # pragma: no cover - optional dependency
     _fla_chunk_gdr = None
 
 
+def _acc(x: torch.Tensor) -> torch.Tensor:
+    """Upcast to at least fp32 for accumulation (fp64 stays fp64, so exactness tests hold)."""
+    return x if x.dtype == torch.float64 else x.float()
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -33,9 +38,9 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
-        x = x.float()
+        x = _acc(x)
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x * self.weight.float()).to(dtype)
+        return (x * _acc(self.weight)).to(dtype)
 
 
 class SwiGLU(nn.Module):
@@ -68,10 +73,10 @@ class PartialRotary(nn.Module):
         """x: [B, T, H, D]; pos: [T] absolute positions."""
         if self.rot_dim == 0:
             return x
-        freqs = pos.float()[:, None] * self.inv_freq[None, :]  # [T, rot/2]
+        freqs = _acc(pos)[:, None] * self.inv_freq[None, :]  # [T, rot/2]
         cos = freqs.cos()[None, :, None, :]
         sin = freqs.sin()[None, :, None, :]
-        xr, xp = x[..., : self.rot_dim].float(), x[..., self.rot_dim :]
+        xr, xp = _acc(x[..., : self.rot_dim]), x[..., self.rot_dim :]
         x1, x2 = xr[..., 0::2], xr[..., 1::2]
         out = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
         return torch.cat((out.to(x.dtype), xp), dim=-1)
@@ -112,15 +117,15 @@ def gated_delta_rule_ref(q, k, v, g, beta, scale: float, state=None):
     """
     B, T, H, Dk = k.shape
     Dv = v.shape[-1]
-    S = q.new_zeros(B, H, Dk, Dv, dtype=torch.float32) if state is None else state.float()
+    S = q.new_zeros(B, H, Dk, Dv, dtype=torch.promote_types(q.dtype, torch.float32)) if state is None else _acc(state)
     out = []
     for t in range(T):
-        S = S * g[:, t].float().exp()[..., None, None]
-        kt, vt = k[:, t].float(), v[:, t].float()
+        S = S * _acc(g[:, t]).exp()[..., None, None]
+        kt, vt = _acc(k[:, t]), _acc(v[:, t])
         pred = torch.einsum("bhkv,bhk->bhv", S, kt)
-        delta = beta[:, t].float()[..., None] * (vt - pred)
+        delta = _acc(beta[:, t])[..., None] * (vt - pred)
         S = S + torch.einsum("bhk,bhv->bhkv", kt, delta)
-        out.append(torch.einsum("bhkv,bhk->bhv", S, q[:, t].float() * scale))
+        out.append(torch.einsum("bhkv,bhk->bhv", S, _acc(q[:, t]) * scale))
     return torch.stack(out, dim=1).to(v.dtype), S
 
 
@@ -150,16 +155,19 @@ class GatedDeltaNet(nn.Module):
         qkv, conv_state = self.conv(self.qkv(x), conv_state)
         qk = self.H * self.dk
         q, k, v = qkv.split([qk, qk, self.H * self.dv], dim=-1)
-        q = F.normalize(q.view(B, T, self.H, self.dk).float(), dim=-1).to(x.dtype)
-        k = F.normalize(k.view(B, T, self.H, self.dk).float(), dim=-1).to(x.dtype)
+        q = F.normalize(_acc(q.view(B, T, self.H, self.dk)), dim=-1).to(x.dtype)
+        k = F.normalize(_acc(k.view(B, T, self.H, self.dk)), dim=-1).to(x.dtype)
         v = v.view(B, T, self.H, self.dv)
-        a, b = self.ab(x).float().chunk(2, dim=-1)
-        g = -self.A_log.float().exp() * F.softplus(a + self.dt_bias.float())  # [B, T, H]
+        a, b = _acc(self.ab(x)).chunk(2, dim=-1)
+        g = -_acc(self.A_log).exp() * F.softplus(a + _acc(self.dt_bias))  # [B, T, H]
         beta = b.sigmoid()
         scale = self.dk**-0.5
         if _fla_chunk_gdr is not None and x.is_cuda and T > 1:
-            # fla wants beta in the activation dtype; the log-decay g stays fp32
-            o, S = _fla_chunk_gdr(q, k, v, g, beta.to(q.dtype), scale=scale, initial_state=S0, output_final_state=True)
+            # fla wants q, k, v, beta in one activation dtype (bf16 under autocast, where the
+            # residual stream stays fp32 but projections come out bf16); the log-decay g stays fp32
+            dt = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else v.dtype
+            o, S = _fla_chunk_gdr(q.to(dt), k.to(dt), v.to(dt), g, beta.to(dt), scale=scale, initial_state=S0,
+                                  output_final_state=True)
         else:
             o, S = gated_delta_rule_ref(q, k, v, g, beta, scale, S0)
         o = self.o_norm(o) * F.silu(self.gate(x)).view(B, T, self.H, self.dv)
@@ -252,8 +260,8 @@ def indexer_scores(iq, iw, ik):
 
     iq: [B, T, Hi, Di]; iw: [B, T, Hi]; ik: [B, Tk, Di] -> [B, T, Tk]
     """
-    s = torch.einsum("bthd,bsd->bths", iq.float(), ik.float()).relu()
-    return torch.einsum("bths,bth->bts", s, iw.float())
+    s = torch.einsum("bthd,bsd->bths", _acc(iq), _acc(ik)).relu()
+    return torch.einsum("bths,bth->bts", s, _acc(iw))
 
 
 def topk_mask(scores: torch.Tensor, causal: torch.Tensor, k: int) -> torch.Tensor:
@@ -299,8 +307,8 @@ class CrossAttention(nn.Module):
         out = self.o_proj(o.reshape(B, T, -1))
         probs = None
         if return_probs:  # for the indexer distillation loss
-            qh = q.transpose(1, 2).float()
-            kh = _repeat_kv(k.transpose(1, 2), c.n_q_heads // c.n_kv_heads).float()
+            qh = _acc(q.transpose(1, 2))
+            kh = _acc(_repeat_kv(k.transpose(1, 2), c.n_q_heads // c.n_kv_heads))
             logits = (qh @ kh.transpose(-1, -2)) / math.sqrt(c.head_dim)
             logits = logits.masked_fill(~mask[:, None], float("-inf"))
             probs = logits.softmax(-1).sum(1)  # [B, T, Tk], summed over heads

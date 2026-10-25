@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from cirrus.config import ModelConfig
 from cirrus.model.layers import (
@@ -22,6 +23,7 @@ from cirrus.model.layers import (
     RMSNorm,
     SharedKV,
     SlidingWindowAttention,
+    _acc,
     indexer_scores,
     topk_mask,
 )
@@ -50,7 +52,7 @@ class Cache:
 
 @dataclass
 class Output:
-    logits: torch.Tensor
+    logits: torch.Tensor | None  # None in training when labels are given (the loss chunks the LM head)
     hidden: torch.Tensor  # pre-final-norm hidden of the returned positions
     cache: Cache | None = None
     loss: torch.Tensor | None = None
@@ -157,21 +159,44 @@ class CirrusModel(nn.Module):
             x = x + y
             x = x + blk.ffn(blk.norm2(x))
 
-        logits = self.lm_head(self.final_norm(x))
+        hn = self.final_norm(x)
+        # training never needs the full [B, T, V] logits: the loss computes them chunk by chunk
+        logits = None if (labels is not None and self.training) else self.lm_head(hn)
         out = Output(logits=logits, hidden=x)
 
         if want_cache:
             out.cache = Cache(new_layers, {k: skv[k].detach() for k in ("k", "v", "ik") if k in skv}, start + T)
 
         if labels is not None:
-            out.loss, out.metrics = self._loss(input_ids, labels, logits, x, scores, probs0, mask, mtp_weight, indexer_weight)
+            out.loss, out.metrics = self._loss(input_ids, labels, hn, x, scores, probs0, mask, mtp_weight, indexer_weight)
         return out
 
     # ----------------------------------------------------------------- loss
-    def _loss(self, input_ids, labels, logits, hidden, scores, probs0, mask, mtp_weight, indexer_weight):
-        V = self.cfg.vocab_size
+    CE_CHUNK = 4096  # positions per LM-head chunk in the loss
+
+    def _ce_sum(self, h: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(_acc(self.lm_head(h)), y, ignore_index=-100, reduction="sum")
+
+    def _ce(self, hn: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Mean next-token CE of normed hidden ``hn`` [B, T, d] against ``labels`` [B, T].
+
+        The LM head runs over CE_CHUNK positions at a time and is recomputed in
+        backward, so peak memory is one chunk of fp32 logits instead of
+        [B, T, V] (about 4 GB per pass at 8 x 4096 x 32K), for ~5% more FLOPs.
+        """
+        h, y = hn.reshape(-1, hn.shape[-1]), labels.reshape(-1)
+        total = h.new_zeros((), dtype=torch.promote_types(h.dtype, torch.float32))
+        for s in range(0, y.numel(), self.CE_CHUNK):
+            hc, yc = h[s : s + self.CE_CHUNK], y[s : s + self.CE_CHUNK]
+            if torch.is_grad_enabled():
+                total = total + checkpoint(self._ce_sum, hc, yc, use_reentrant=False)
+            else:
+                total = total + self._ce_sum(hc, yc)
+        return total / (y != -100).sum().clamp_min(1)
+
+    def _loss(self, input_ids, labels, hn, hidden, scores, probs0, mask, mtp_weight, indexer_weight):
         T = input_ids.shape[1]
-        ce = F.cross_entropy(logits[:, :-1].reshape(-1, V).float(), labels[:, 1:].reshape(-1), ignore_index=-100)
+        ce = self._ce(hn[:, :-1], labels[:, 1:])
         loss, metrics = ce, {"ce": ce.detach()}
         if mtp_weight > 0 and len(self.mtp):
             h, mtp_losses = hidden, []
@@ -181,10 +206,7 @@ class CirrusModel(nn.Module):
                         break
                     # h[:, t] predicted token t+j; feed token t+j, predict t+j+1
                     h = mod(h[:, :-1], self.embed(input_ids[:, j:]))
-                    lg = self.lm_head(self.final_norm(h))
-                    mtp_losses.append(
-                        F.cross_entropy(lg[:, : T - j - 1].reshape(-1, V).float(), labels[:, j + 1 :].reshape(-1), ignore_index=-100)
-                    )
+                    mtp_losses.append(self._ce(self.final_norm(h)[:, : T - j - 1], labels[:, j + 1 :]))
                 h = hidden
             if mtp_losses:
                 mtp = torch.stack(mtp_losses).mean()

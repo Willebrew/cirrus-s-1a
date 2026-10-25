@@ -109,3 +109,22 @@ def test_topk_mask_ties_break_the_same_in_prefill_and_decode():
     for p in range(T):  # decode row for query p sees only keys 0..p
         row = topk_mask(scores[:, p : p + 1, : p + 1], causal[:, p : p + 1, : p + 1], k)
         assert torch.equal(row[0, 0], full[0, p, : p + 1]), p
+
+
+def test_chunked_loss_matches_full_logits():
+    import torch.nn.functional as F
+
+    m = model().train()
+    m.CE_CHUNK = 7  # force several ragged chunks
+    ids = torch.randint(0, m.cfg.vocab_size, (2, 20))
+    out = m(ids, labels=ids, mtp_weight=0.0)
+    assert out.logits is None
+    out.loss.backward()
+    g_chunk = m.embed.weight.grad.clone()
+    m.zero_grad()
+    m.eval()
+    logits = m(ids).logits
+    ref = F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]), ids[:, 1:].reshape(-1))
+    ref.backward()
+    torch.testing.assert_close(out.loss, ref)
+    torch.testing.assert_close(g_chunk, m.embed.weight.grad)

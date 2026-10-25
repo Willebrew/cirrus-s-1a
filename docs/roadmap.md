@@ -46,18 +46,27 @@ the weights have learned (except τ, which is measured separately in 1d).
 throughput is ≥ 3,000 tok/s at τ ≥ 1.65. Phase 1 confirms it on hardware; `cirrus-s-1a-large`
 (~290M) is only reconsidered if the *measured* numbers show at least 1.8× headroom.
 
-## Phase 2: tokenizer + data pipeline
+## Phase 2: tokenizer + data pipeline + trainer (code ready; runbook in `docs/plans/training-runbook.md`)
 
-- 32K BPE trained on the pretraining mix, digits split individually, protocol special tokens
-  reserved (`cirrus/agent/protocol.py::SPECIAL_TOKENS`), ids roughly frequency-ordered so the
-  FR-Spec draft vocabulary is a prefix.
-- Streaming, deduplicated, tokenized shards for each mix in `docs/research/datasets.md`.
-- Offline search environment: BM25 + small dense retriever over wiki-18, a FineWeb-Edu slice,
+- [x] 32K byte-level BPE, digits split individually, 64 reserved ids (control + protocol
+  tokens), all other ids frequency ordered so the FR-Spec draft vocabulary is the id prefix
+  (`cirrus/data/tokenizer.py`, `scripts/train_tokenizer.py`). To run on a Spark.
+- [x] Streaming, resumable, tokenized shards for the lean mix, with per-source held-out val
+  (`cirrus/data/`, `scripts/prepare_data.py`). Documents are rendered source-first,
+  answer-after. To run on the Sparks.
+- [x] Pretraining loop for one GPU: Muon + AdamW, WSD with a saved branch point, bf16
+  autocast, chunked LM-head loss, exact resume, per-source val (`scripts/train.py`).
+- [ ] Offline search environment: BM25 + small dense retriever over wiki-18, a FineWeb-Edu slice,
   a frozen fresh Common Crawl snapshot and BrowseComp-Plus, with a counterfactual rewriter.
 
-## Phase 3: pretraining (≈1-1.5T tokens), which needs rented GPUs
+## Phase 3: pretraining on own hardware (lean recipe, 200B tokens on the RTX 4090)
 
-Budget (docs/plans/training-budget.md, `scripts/training_budget.py`): **≈2,760 H100-hours and
+**Decision (made):** train locally. Six 3B-token ablations on the 4090 first, then the
+200B-token lean run (6-11 weeks depending on the measured tok/s); the Sparks prepare data,
+generate teacher trajectories and evaluate in parallel. The rented-cluster budget below is
+kept for reference, in case the ablations argue for the full 1-1.5T plan.
+
+Rented budget (docs/plans/training-budget.md, `scripts/training_budget.py`): **≈2,760 H100-hours and
 ≈$12.6k all-in in the base case** (range ≈$5.6k-$33k). Pretraining is ~60% of the GPU hours,
 about 26 hours on 64 H100s. A single Spark would take more than a year, so the Sparks handle
 inference, evaluation and small ablations. Before booking: measure training tokens/s on one
