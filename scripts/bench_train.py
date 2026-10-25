@@ -10,8 +10,9 @@ What it does:
   1. checks fla's chunked Gated DeltaNet kernel against our exact reference
      recurrence (forward and gradients); training is impossible without it,
      because the reference runs as a Python loop over time
-  2. times full training steps (forward + backward + AdamW) of the real
-     155M model on random tokens, sweeping micro-batch size until OOM
+  2. times full training steps of the real 155M model on random tokens with
+     the exact recipe of scripts/train.py (fp32 weights, bf16 autocast,
+     Muon + AdamW), sweeping micro-batch size until OOM
   3. reports tokens/s, peak memory, model-FLOPs utilisation, and how long the
      planned token budgets would take on this one GPU
 
@@ -35,6 +36,7 @@ sys.path.insert(0, str(ROOT))
 import torch  # noqa: E402
 
 from cirrus.config import get_config  # noqa: E402
+from cirrus.train.optim import build_optimizers  # noqa: E402
 
 # dense BF16 tensor throughput with FP32 accumulation, TFLOPS: spec for the
 # 4090, our run-1 measured best GEMM for GB10
@@ -79,18 +81,20 @@ def check_fla() -> dict:
     return out
 
 
-def time_steps(model, opt, micro: int, seq: int, steps: int, warmup: int, vocab: int, mtp: float) -> dict:
+def time_steps(model, opts, micro: int, seq: int, steps: int, warmup: int, vocab: int, mtp: float) -> dict:
     torch.cuda.reset_peak_memory_stats()
     ids = torch.randint(0, vocab, (micro, seq), device="cuda")
     for i in range(warmup + steps):
         if i == warmup:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-        out = model(ids, labels=ids, mtp_weight=mtp)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = model(ids, labels=ids, mtp_weight=mtp)
         out.loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        opt.zero_grad(set_to_none=True)
+        for o in opts:
+            o.step()
+            o.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
     dt = (time.perf_counter() - t0) / steps
     return {"micro": micro, "step_s": round(dt, 4), "tok_s": round(micro * seq / dt),
@@ -105,6 +109,7 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--mtp", type=float, default=0.3, help="MTP loss weight (0 disables the MTP passes)")
     ap.add_argument("--compile", action="store_true", help="also try torch.compile")
+    ap.add_argument("--optim", default="muon", choices=["muon", "adamw"])
     ap.add_argument("--allow-slow", action="store_true", help="run even without the fused GDN kernel")
     ap.add_argument("--out", default=str(ROOT / "results" / "local"))
     args = ap.parse_args()
@@ -137,13 +142,14 @@ def main() -> None:
     rows = []
     for compiled in ([False, True] if args.compile else [False]):
         torch.manual_seed(0)
-        model = CirrusModel(cfg).cuda().to(torch.bfloat16).train()
-        opt = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=True)
+        # same recipe as scripts/train.py: fp32 master weights, bf16 autocast, Muon + AdamW
+        model = CirrusModel(cfg).cuda().train()
+        opts = build_optimizers(model, args.optim, 2e-3, 0.1)
         fwd = torch.compile(model) if compiled else model
         print(f"\n== training step, seq {args.seq}, {'torch.compile' if compiled else 'eager'} ==")
         for micro in args.micro:
             try:
-                r = time_steps(fwd, opt, micro, args.seq, args.steps, args.warmup, cfg.vocab_size, args.mtp)
+                r = time_steps(fwd, opts, micro, args.seq, args.steps, args.warmup, cfg.vocab_size, args.mtp)
             except torch.cuda.OutOfMemoryError:
                 print(f"   micro {micro:2d}: out of memory")
                 torch.cuda.empty_cache()
@@ -153,7 +159,7 @@ def main() -> None:
             rows.append(r)
             print(f"   micro {micro:2d}: {r['tok_s']:>9,d} tok/s  step {r['step_s'] * 1e3:7.1f} ms  "
                   f"peak {r['peak_gb']:5.1f} GB  MFU {r['mfu']}  loss {r['loss']}")
-        del model, opt, fwd
+        del model, opts, fwd
         torch.cuda.empty_cache()
 
     report["runs"] = rows
