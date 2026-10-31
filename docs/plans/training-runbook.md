@@ -12,8 +12,8 @@ reboot or Ctrl-C.
 | 1. tokenizer | Spark A | `python scripts/train_tokenizer.py` | ~1-2 h |
 | 2. ablation data | Spark A | `python scripts/prepare_data.py --tokens 3e9 --out data/ablate` | ~1-3 h |
 | 3. full data | Spark A + B | `python scripts/prepare_data.py --tokens 200e9 --out data/lean` | ~1-3 days, download-bound |
-| 4. ablations | 4090 | `python scripts/train.py --data data/ablate --out runs/abl-muon --tokens 3e9` (and variants) | ~43 h each at the measured 19K tok/s (eager) |
-| 5. pretrain | 4090 | `python scripts/train.py --data data/lean --out runs/lean --tokens 200e9 --compile` | 6-11 weeks |
+| 4. ablations | 4090 | `python scripts/train.py --data data/ablate --out runs/abl-muon --tokens 3e9` (and variants) | ~22 h each at the measured 37.7K tok/s (`--compile --micro 4`) |
+| 5. pretrain | 4090 | `python scripts/train.py --data data/lean --out runs/lean --tokens 200e9 --compile --micro 4` | ~61 days at 37.7K tok/s |
 
 Protocol transcripts for mid-training and SFT (CPU, a few minutes, any machine):
 `python scripts/make_episodes.py --out data/episodes/train.jsonl` (and `--split validation`).
@@ -73,10 +73,12 @@ reports validation loss per source, which is what the ablations compare.
 
 **Memory.** `--workers` sets how many slices the data is split into (locked once an `--out`
 directory exists, since each slice's resume point lives in its own files); `--procs` sets how
-many run at once and can change on every run. By default `--procs` fits `--max-mem-gb 20` at
-~2 GB per process (shards stream to disk; the remaining cost is one decoded parquet row group
-of the columns we render). Each progress line prints that worker's RSS: if it runs higher on
-some source, lower `--max-mem-gb` or pass `--procs` explicitly.
+many run at once and can change on every run. Slices start only while their summed memory
+estimates fit `--max-mem-gb` (default 20): ~2 GB per worker, 3.5 GB for SYNTH, whose large row
+groups measured ~3 GB on the 4090 box (shards stream to disk; the remaining cost is one decoded
+parquet row group of the columns we render). Each progress line prints that worker's RSS: if a
+source runs higher than its estimate, lower `--max-mem-gb` or raise `Source.mem_gb`. Workers
+hard-exit after their final save, so a slice's result always comes from its state file.
 
 To split step 3 across both Sparks, give each a disjoint `--sources` list with otherwise
 identical arguments, then merge the `train/` and `val/` directories:
@@ -90,7 +92,8 @@ python scripts/prepare_data.py --tokens 200e9 --out data/lean --sources fineweb_
 
 ## 4. Ablations (decide before the long run)
 
-Each ablation is 3B tokens: about 43 hours on the 4090 at the measured 19,241 tok/s (eager, micro 2).
+Each ablation is 3B tokens: about 22 hours on the 4090 at the measured 37.7K tok/s (compiled, micro 4;
+19.6K eager). Compare runs with `python scripts/compare_runs.py runs/abl-*`.
 Compare `val ce` per source at equal tokens (all runs log to `runs/<name>/log.jsonl`).
 
 | # | question | runs |

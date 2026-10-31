@@ -158,3 +158,30 @@ def test_resume_keeps_the_original_slice_count(tmp_path, capsys):
     with pytest.raises(SystemExit):
         prepare_data.reconcile_manifest(mpath, {**m, "budgets": {"a": 11}})
     assert prepare_data.reconcile_manifest(tmp_path / "none.json", m) is m
+
+
+def test_run_slices_respects_memory_and_reports_failures(tmp_path):
+    import slice_stub  # light module: each spawned child imports it
+
+    tasks = [("big", 0, 2, 10), ("big", 1, 2, 10), ("small", 0, 2, 5), ("small", 1, 2, 5), ("crash", 0, 1, 7)]
+    mem = {"big": 3.0, "small": 1.0, "crash": 1.0}
+    logs = []
+    done, failed = prepare_data.run_slices(tasks, {"out": str(tmp_path)}, mem.get, max_mem_gb=4.0, max_procs=8,
+                                           target=slice_stub.fake_slice, log=logs.append)
+    assert sorted((r["source"], r["rank"]) for r in done) == [("big", 0), ("big", 1), ("small", 0), ("small", 1)]
+    assert [(f["source"], f["exitcode"]) for f in failed] == [("crash", 3)]
+    assert any(m.startswith("FAILED crash/0") for m in logs)
+    spans = [(n, float(a), float(b)) for n, a, b in (ln.split() for ln in (tmp_path / "intervals.txt").read_text()
+                                                       .splitlines())]
+    for t in sorted({s for _, s, _ in spans} | {e - 1e-6 for _, _, e in spans}):
+        live = sum(mem[n] for n, s, e in spans if s <= t < e)
+        assert live <= 4.0  # never more than the budget at once
+    bigs = [(s, e) for n, s, e in spans if n == "big"]
+    assert bigs[0][1] <= bigs[1][0] or bigs[1][1] <= bigs[0][0]  # the two 3 GB slices never overlapped
+
+
+def test_real_slice_entry_reports_a_crash(tmp_path):
+    a = {"tokenizer": str(TOKENIZER), "out": str(tmp_path), "val_tokens": 0, "shard_tokens": 1000, "max_passes": {}}
+    done, failed = prepare_data.run_slices([("no_such_source", 0, 1, 10)], a, lambda n: 1.0, 4.0, 1,
+                                           log=lambda m: None)
+    assert not done and failed[0]["exitcode"] == 1

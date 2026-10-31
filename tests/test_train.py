@@ -108,3 +108,18 @@ def test_compile_layers_matches_eager():
     torch.testing.assert_close(lc, le, rtol=1e-4, atol=1e-4)
     for (n, pe), pc in zip(eager.named_parameters(), comp.parameters()):
         torch.testing.assert_close(pc.grad, pe.grad, rtol=1e-3, atol=1e-5, msg=n)
+
+
+def test_compare_runs(tmp_path, capsys):
+    import compare_runs
+
+    for name, ce in (("a", 3.0), ("b", 2.5)):
+        d = tmp_path / name
+        d.mkdir()
+        recs = [{"step": s, "tokens": s * 100, "ce": ce, "tok_s": 1000} for s in (10, 20)]
+        recs.insert(1, {"step": 10, "val": {"web": ce + 0.1, "qa": ce, "mean": ce + 0.05}})
+        recs.append({"step": 20, "val": {"web": ce, "qa": ce - 0.1, "mean": ce - 0.05}})
+        (d / "log.jsonl").write_text("\n".join(json.dumps(r) for r in recs))
+    compare_runs.main([str(tmp_path / "a"), str(tmp_path / "b"), "--at", "1000", "2000"])
+    out = capsys.readouterr().out
+    assert "val ce at 2,000 tokens" in out and "2.4000*" in out and "2.9000 " in out

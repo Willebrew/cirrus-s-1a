@@ -27,6 +27,7 @@ class Source:
     builder: str | None = None  # e.g. "json" for raw jsonl.zst files
     split: str = "train"
     columns: tuple[str, ...] | None = None  # parquet: read only these (what render uses)
+    mem_gb: float = 2.0  # peak RSS of one worker on this source (prepare_data schedules by it)
     note: str = ""
 
     def stream(self, rank: int = 0, world: int = 1, state: dict | None = None) -> DocStream:
@@ -152,8 +153,8 @@ SOURCES: dict[str, Source] = {
     s.name: s
     for s in (
         Source("synth", "PleIAs/SYNTH", render_synth(),
-               columns=("language", "query", "query_seed_text", "synthetic_answer"),
-               note="~60B English tokens; RAG-style exercises"),
+               columns=("language", "query", "query_seed_text", "synthetic_answer"), mem_gb=3.5,
+               note="~60B English tokens; RAG-style exercises (large row groups: ~3 GB per worker measured)"),
         Source("finephrase_faq", "HuggingFaceFW/finephrase", render_finephrase("Frequently asked questions"),
                config="faq", columns=("text", "rollout_results"), note="document followed by an FAQ written from it"),
         Source("finephrase_table", "HuggingFaceFW/finephrase", render_finephrase("Key facts"),
